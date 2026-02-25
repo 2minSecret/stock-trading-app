@@ -113,6 +113,8 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
       setIsLoading(true);
       setError(null);
 
+      const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
       const customConfig = {
         TRADING_WINDOW: { START: startTime, END: endTime },
         ACTIVE_DAYS: activeDays,
@@ -124,6 +126,7 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
         PROFIT_PATIENCE_MIN: parseInt(profitPatienceMin),
         PROFIT_PATIENCE_MAX: parseInt(profitPatienceMax),
         PROFIT_DECLINE_THRESHOLD: profitDeclineThreshold / 100,
+        TIMEZONE: browserTimezone,
       };
 
       const response = await axios.post(`${API_BASE_URL}/api/trading/bot/start`, {

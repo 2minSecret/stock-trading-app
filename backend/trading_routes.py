@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from liquid_charts_api import LiquidChartsAPI
 import httpx
+import asyncio
 import time
 import json
 import logging
@@ -55,13 +56,27 @@ class PlaceAccountOrderRequest(BaseModel):
     account_code: str
     order: dict
 
+
+class PlaceAccountBracketOrderRequest(BaseModel):
+    account_code: str
+    entry_order: Dict[str, Any]
+    stop_loss_price: float
+    take_profit_price: float
+
 class BotOrderRequest(BaseModel):
     """Request format for bot-automated trading"""
     accountId: str
-    symbol: str
+    symbol: Optional[str] = None
+    instrument: Optional[str] = None
     side: str  # 'buy' or 'sell'
     quantity: float
-    amount: float
+    amount: Optional[float] = None
+    orderType: str = "MARKET"
+    tif: str = "GTC"
+    positionEffect: str = "OPEN"
+    positionCode: Optional[str] = None
+    orderCode: Optional[str] = None
+    price: Optional[float] = None
     username: str
     password: str
 
@@ -155,6 +170,25 @@ def _is_eventtypes_validation_error(response_body: Any) -> bool:
     return "eventtypes" in description
 
 
+def _is_html_error_payload(response_body: Any) -> bool:
+    if not isinstance(response_body, str):
+        return False
+    lowered = response_body.lower()
+    return "<html" in lowered or "<!doctype html" in lowered
+
+
+def _safe_upstream_detail(response_body: Any, status_code: int) -> Any:
+    if _is_html_error_payload(response_body):
+        return {
+            "message": "Upstream Liquid Charts returned HTML instead of JSON.",
+            "hint": "Session may be expired/invalid or upstream endpoint rejected the request.",
+            "status_code": status_code,
+        }
+    if isinstance(response_body, str) and len(response_body) > 2000:
+        return response_body[:2000] + "..."
+    return response_body
+
+
 def _build_quote_from_ohlc_payload(symbol: str, market: str, ohlc_data: Any) -> Dict[str, Any]:
     row = None
     if isinstance(ohlc_data, list) and ohlc_data:
@@ -194,6 +228,193 @@ def _build_quote_from_ohlc_payload(symbol: str, market: str, ohlc_data: Any) -> 
             }
         ]
     }
+
+
+def _extract_position_code_from_payload(payload: Any) -> Optional[str]:
+    if not payload or not isinstance(payload, dict):
+        return None
+
+    direct = payload.get("positionCode") or payload.get("position_code")
+    if direct:
+        return str(direct)
+
+    data = payload.get("data")
+    if isinstance(data, dict):
+        nested = data.get("positionCode") or data.get("position_code")
+        if nested:
+            return str(nested)
+
+    return None
+
+
+def _extract_positions_list(payload: Any) -> list[dict]:
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    for key in ("positions", "items", "data"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [row for row in value if isinstance(row, dict)]
+
+    for value in payload.values():
+        if isinstance(value, list):
+            dict_rows = [row for row in value if isinstance(row, dict)]
+            if dict_rows:
+                return dict_rows
+
+    return []
+
+
+def _position_matches_instrument(position_row: dict, instrument: str) -> bool:
+    fields = (
+        position_row.get("instrument"),
+        position_row.get("symbol"),
+        position_row.get("security"),
+        position_row.get("ticker"),
+    )
+    values = {str(v).upper() for v in fields if v is not None}
+    return instrument.upper() in values
+
+
+def _position_side_matches_entry(position_row: dict, entry_side: str) -> bool:
+    row_side = str(
+        position_row.get("side")
+        or position_row.get("positionSide")
+        or position_row.get("direction")
+        or ""
+    ).upper()
+    if not row_side:
+        return True
+    if entry_side == "BUY":
+        return row_side in ("BUY", "LONG")
+    return row_side in ("SELL", "SHORT")
+
+
+async def _resolve_position_code_after_entry(
+    account_code: str,
+    instrument: str,
+    entry_side: str,
+    token: str,
+    auth_type: str,
+    max_attempts: int = 8,
+    delay_seconds: float = 0.75,
+) -> Optional[str]:
+    for _ in range(max_attempts):
+        try:
+            positions_payload = await LiquidChartsAPI.get_open_positions(
+                account_code=account_code,
+                token=token,
+                auth_type=auth_type,
+            )
+        except Exception:
+            await asyncio.sleep(delay_seconds)
+            continue
+
+        rows = _extract_positions_list(positions_payload)
+        filtered = [
+            row for row in rows
+            if _position_matches_instrument(row, instrument)
+            and _position_side_matches_entry(row, entry_side)
+        ]
+        if not filtered:
+            filtered = [row for row in rows if _position_matches_instrument(row, instrument)]
+
+        for row in filtered:
+            position_code = row.get("positionCode") or row.get("position_code") or row.get("code") or row.get("id")
+            if position_code:
+                return str(position_code)
+
+        await asyncio.sleep(delay_seconds)
+
+    return None
+
+
+def _extract_error_code_and_description(error_detail: Any) -> tuple[Optional[str], str]:
+    if isinstance(error_detail, dict):
+        code = error_detail.get("errorCode")
+        description = error_detail.get("description") or error_detail.get("message") or ""
+        return (str(code) if code is not None else None, str(description))
+    return (None, str(error_detail or ""))
+
+
+def _is_retriable_shape_error(error_detail: Any) -> bool:
+    code, description = _extract_error_code_and_description(error_detail)
+    if code in ("32", "33"):
+        return True
+    lowered = description.lower()
+    return "incorrect request" in lowered or "incorrect request parameters" in lowered
+
+
+async def _place_leg_with_type_fallback(
+    account_code: str,
+    order_template: Dict[str, Any],
+    order_code_prefix: str,
+    fallback_types: list[str],
+    token: str,
+    auth_type: str,
+) -> tuple[Optional[Dict[str, Any]], Optional[Any], list[Dict[str, Any]]]:
+    attempts: list[Dict[str, Any]] = []
+
+    for index, leg_type in enumerate(fallback_types):
+        base_payload = dict(order_template)
+        base_payload["type"] = leg_type
+
+        variant_payloads: list[tuple[str, Dict[str, Any]]] = []
+        if leg_type == "LIMIT":
+            price_value = base_payload.get("price")
+            if price_value is not None:
+                only_price = dict(base_payload)
+                only_price.pop("limitPrice", None)
+                variant_payloads.append(("price", only_price))
+
+                only_limit_price = dict(base_payload)
+                only_limit_price.pop("price", None)
+                only_limit_price["limitPrice"] = price_value
+                variant_payloads.append(("limitPrice", only_limit_price))
+
+                both = dict(base_payload)
+                both["limitPrice"] = price_value
+                variant_payloads.append(("price+limitPrice", both))
+            else:
+                variant_payloads.append(("default", base_payload))
+        else:
+            payload = dict(base_payload)
+            if leg_type == "STOP":
+                if "price" in payload:
+                    payload["stopPrice"] = payload["price"]
+            elif leg_type in ("STOP_MARKET", "STOP_LIMIT"):
+                if "price" in payload:
+                    payload["stopPrice"] = payload["price"]
+            variant_payloads.append(("default", payload))
+
+        for variant_index, (variant_name, payload) in enumerate(variant_payloads):
+            payload["orderCode"] = f"{order_code_prefix}-{int(time.time() * 1000)}-{index}-{variant_index}"
+            try:
+                result = await LiquidChartsAPI.place_account_order(
+                    account_code=account_code,
+                    order_payload=payload,
+                    token=token,
+                    auth_type=auth_type,
+                )
+                attempts.append({"type": leg_type, "variant": variant_name, "status": "ok"})
+                return result, None, attempts
+            except httpx.HTTPStatusError as e:
+                try:
+                    err = e.response.json()
+                except Exception:
+                    err = e.response.text
+                attempts.append({"type": leg_type, "variant": variant_name, "status": "error", "error": err})
+                if not _is_retriable_shape_error(err):
+                    return None, err, attempts
+            except Exception as e:
+                err = str(e)
+                attempts.append({"type": leg_type, "variant": variant_name, "status": "error", "error": err})
+                return None, err, attempts
+
+    last_error = attempts[-1]["error"] if attempts else "Unknown error"
+    return None, last_error, attempts
 
 
 # ===== Market Data Endpoints =====
@@ -262,6 +483,53 @@ async def get_ohlc(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/yahoo/history")
+async def get_yahoo_history(
+    symbol: str = Query(..., description="Stock symbol (e.g., AAPL, ^IXIC for NASDAQ)"),
+    period: str = Query("1d", description="Data period (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max)"),
+    interval: str = Query("1h", description="Data interval (1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo)"),
+):
+    """Get historical OHLC data from Yahoo Finance"""
+    try:
+        import yfinance as yf
+        import asyncio
+        
+        def fetch_history():
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period=period, interval=interval)
+            
+            if hist.empty:
+                return []
+            
+            # Convert to list of candles
+            candles = []
+            for timestamp, row in hist.iterrows():
+                candles.append({
+                    "ts": int(timestamp.timestamp() * 1000),  # Convert to milliseconds
+                    "open": float(row['Open']),
+                    "high": float(row['High']),
+                    "low": float(row['Low']),
+                    "close": float(row['Close']),
+                    "volume": int(row['Volume']) if 'Volume' in row else 0,
+                })
+            
+            return candles
+        
+        # Run yfinance in a thread to avoid blocking
+        candles = await asyncio.to_thread(fetch_history)
+        
+        return {
+            "success": True,
+            "symbol": symbol,
+            "candles": candles,
+            "count": len(candles)
+        }
+        
+    except Exception as e:
+        logger.error(f"Yahoo Finance history error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch Yahoo Finance data: {str(e)}")
+
+
 @router.post("/marketdata")
 async def post_dxsca_market_data(
     payload: DxscaMarketDataRequest,
@@ -318,33 +586,6 @@ async def post_dxsca_market_data(
         except (TypeError, ValueError):
             limit = 200
 
-        if isinstance(symbol, str) and symbol.strip():
-            if request_type == "candles":
-                print("INFO: Using /price-history for candles request")
-                data = await LiquidChartsAPI.get_ohlc(
-                    symbol=symbol.strip(),
-                    timeframe=timeframe,
-                    limit=limit,
-                    token=token,
-                    auth_type=auth_type,
-                )
-                if client_key:
-                    _marketdata_unauthorized_until.pop(client_key, None)
-                return data
-            if request_type == "quote":
-                print("INFO: Using OHLC-derived quote for quote request")
-                ohlc_data = await LiquidChartsAPI.get_ohlc(
-                    symbol=symbol.strip(),
-                    timeframe="1m",
-                    limit=2,
-                    token=token,
-                    auth_type=auth_type,
-                )
-                data = _build_quote_from_ohlc_payload(symbol=symbol.strip(), market=market, ohlc_data=ohlc_data)
-                if client_key:
-                    _marketdata_unauthorized_until.pop(client_key, None)
-                return data
-
         data = await LiquidChartsAPI.post_market_data(
             request_payload=normalized_request,
             token=token,
@@ -368,49 +609,17 @@ async def post_dxsca_market_data(
             and normalized_request
             and _is_eventtypes_validation_error(response_body)
         ):
-            request_type = str(normalized_request.get("type") or "").strip().lower()
-            symbols = normalized_request.get("symbols") or []
-            symbol = symbols[0] if isinstance(symbols, list) and symbols else None
-            market = str(normalized_request.get("market") or "spot")
-            timeframe = str(normalized_request.get("timeframe") or "1h")
-            limit_value = normalized_request.get("limit")
-            try:
-                limit = int(limit_value) if limit_value is not None else 200
-            except (TypeError, ValueError):
-                limit = 200
-
-            if isinstance(symbol, str) and symbol.strip():
-                try:
-                    if request_type == "candles":
-                        print("WARN: Falling back to /price-history due to DXSCA eventTypes validation error")
-                        return await LiquidChartsAPI.get_ohlc(
-                            symbol=symbol.strip(),
-                            timeframe=timeframe,
-                            limit=limit,
-                            token=token,
-                            auth_type=auth_type,
-                        )
-                    if request_type == "quote":
-                        print("WARN: Falling back to OHLC-derived quote due to DXSCA eventTypes validation error")
-                        ohlc_data = await LiquidChartsAPI.get_ohlc(
-                            symbol=symbol.strip(),
-                            timeframe="1m",
-                            limit=2,
-                            token=token,
-                            auth_type=auth_type,
-                        )
-                        return _build_quote_from_ohlc_payload(symbol=symbol.strip(), market=market, ohlc_data=ohlc_data)
-                except Exception as fallback_error:
-                    print(f"ERROR: EventTypes fallback failed: {fallback_error}")
+            print("WARN: Upstream rejected marketdata payload with eventTypes validation after compatibility retries")
         
         print(f"ERROR: Upstream marketdata HTTP {e.response.status_code}")
         print(f"ERROR: Response body: {response_body}")
         if normalized_request:
             print(f"ERROR: Request that failed: {json.dumps(normalized_request)}")
+        safe_detail = _safe_upstream_detail(response_body, e.response.status_code)
         raise HTTPException(
             status_code=e.response.status_code,
             detail={
-                "upstream": response_body,
+                "upstream": safe_detail,
                 "debug": {
                     "auth_type": auth_type if 'auth_type' in locals() else None,
                     "has_token": bool(token) if 'token' in locals() else False,
@@ -579,8 +788,11 @@ async def place_account_order(
         if not isinstance(request.order, dict) or not request.order:
             raise HTTPException(status_code=400, detail="order payload is required")
 
-        if not request.order.get("clientOrderId"):
-            raise HTTPException(status_code=400, detail="clientOrderId is required")
+        if not request.order.get("orderCode") and not request.order.get("clientOrderId"):
+            raise HTTPException(status_code=400, detail="orderCode (or clientOrderId) is required")
+
+        if not request.order.get("instrument") and not request.order.get("symbol"):
+            raise HTTPException(status_code=400, detail="instrument (or symbol) is required")
 
         result = await LiquidChartsAPI.place_account_order(
             account_code=request.account_code,
@@ -589,6 +801,195 @@ async def place_account_order(
             auth_type="basic" if x_liquid_token else "bearer",
         )
         return result
+    except httpx.HTTPStatusError as e:
+        response_body = None
+        try:
+            response_body = e.response.json()
+        except Exception:
+            response_body = e.response.text
+        raise HTTPException(status_code=e.response.status_code, detail=response_body)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/orders/account/place-bracket")
+async def place_account_bracket_order(
+    request: PlaceAccountBracketOrderRequest,
+    authorization: Optional[str] = Header(default=None),
+    x_liquid_token: Optional[str] = Header(default=None, alias="X-Liquid-Token"),
+):
+    """Phase 2 bracket flow: place entry, resolve position code, and auto-place TP/SL close legs."""
+    try:
+        token = x_liquid_token or get_user_token(authorization)
+        if not token:
+            raise HTTPException(status_code=401, detail="Authentication required")
+
+        if not request.account_code:
+            raise HTTPException(status_code=400, detail="account_code is required")
+
+        entry_order = dict(request.entry_order or {})
+        if not entry_order:
+            raise HTTPException(status_code=400, detail="entry_order is required")
+
+        instrument = entry_order.get("instrument") or entry_order.get("symbol")
+        if not instrument:
+            raise HTTPException(status_code=400, detail="entry_order.instrument (or symbol) is required")
+
+        side = str(entry_order.get("side", "")).upper()
+        if side not in ("BUY", "SELL"):
+            raise HTTPException(status_code=400, detail="entry_order.side must be BUY or SELL")
+
+        order_type = str(entry_order.get("type") or entry_order.get("orderType") or "MARKET").upper()
+        if order_type not in ("MARKET", "LIMIT"):
+            raise HTTPException(status_code=400, detail="entry_order.type must be MARKET or LIMIT")
+
+        quantity = entry_order.get("quantity")
+        try:
+            quantity = float(quantity)
+        except Exception:
+            quantity = None
+        if not quantity or quantity <= 0:
+            raise HTTPException(status_code=400, detail="entry_order.quantity must be > 0")
+
+        stop_loss = float(request.stop_loss_price)
+        take_profit = float(request.take_profit_price)
+        if stop_loss <= 0 or take_profit <= 0:
+            raise HTTPException(status_code=400, detail="stop_loss_price and take_profit_price must be > 0")
+
+        entry_price = entry_order.get("price")
+        if entry_price is not None:
+            try:
+                entry_price = float(entry_price)
+            except Exception:
+                entry_price = None
+
+        # Directional validation (entry reference required for strict checks)
+        if entry_price and side == "BUY":
+            if not (stop_loss < entry_price < take_profit):
+                raise HTTPException(status_code=400, detail="For BUY: stop_loss < entry_price < take_profit is required")
+        elif entry_price and side == "SELL":
+            if not (take_profit < entry_price < stop_loss):
+                raise HTTPException(status_code=400, detail="For SELL: take_profit < entry_price < stop_loss is required")
+        elif abs(take_profit - stop_loss) < 1e-9:
+            raise HTTPException(status_code=400, detail="take_profit_price and stop_loss_price must be different")
+
+        entry_order_normalized = {
+            "orderCode": entry_order.get("orderCode") or entry_order.get("clientOrderId") or f"web-{int(time.time() * 1000)}",
+            "type": order_type,
+            "positionEffect": entry_order.get("positionEffect") or "OPEN",
+            "tif": entry_order.get("tif") or entry_order.get("timeInForce") or "GTC",
+            "instrument": instrument,
+            "side": side,
+            "quantity": quantity,
+        }
+        if order_type == "LIMIT":
+            if not entry_price or entry_price <= 0:
+                raise HTTPException(status_code=400, detail="LIMIT entry requires entry_order.price > 0")
+            entry_order_normalized["price"] = entry_price
+
+        auth_type = "basic" if x_liquid_token else "bearer"
+
+        entry_result = await LiquidChartsAPI.place_account_order(
+            account_code=request.account_code,
+            order_payload=entry_order_normalized,
+            token=token,
+            auth_type=auth_type,
+        )
+
+        position_code = _extract_position_code_from_payload(entry_result)
+        if not position_code:
+            position_code = await _resolve_position_code_after_entry(
+                account_code=request.account_code,
+                instrument=instrument,
+                entry_side=side,
+                token=token,
+                auth_type=auth_type,
+            )
+
+        if not position_code:
+            return {
+                "status": "entry_placed_position_pending",
+                "entry_order": entry_result,
+                "bracket_plan": {
+                    "stop_loss_price": stop_loss,
+                    "take_profit_price": take_profit,
+                    "note": "Entry placed, but position code is not available yet. TP/SL auto-legs were not submitted.",
+                },
+            }
+
+        close_side = "SELL" if side == "BUY" else "BUY"
+        base_leg = {
+            "positionEffect": "CLOSE",
+            "positionCode": str(position_code),
+            "tif": "GTC",
+            "instrument": instrument,
+            "side": close_side,
+            "quantity": quantity,
+        }
+
+        tp_order = {
+            "price": take_profit,
+            **base_leg,
+        }
+        sl_order = {
+            "price": stop_loss,
+            **base_leg,
+        }
+
+        tp_result, tp_error, tp_attempts = await _place_leg_with_type_fallback(
+            account_code=request.account_code,
+            order_template=tp_order,
+            order_code_prefix="tp",
+            fallback_types=["LIMIT"],
+            token=token,
+            auth_type=auth_type,
+        )
+        sl_result, sl_error, sl_attempts = await _place_leg_with_type_fallback(
+            account_code=request.account_code,
+            order_template=sl_order,
+            order_code_prefix="sl",
+            fallback_types=["STOP", "STOP_MARKET", "STOP_LIMIT"],
+            token=token,
+            auth_type=auth_type,
+        )
+
+        if tp_result and sl_result:
+            status = "entry_tp_sl_placed"
+        elif tp_result or sl_result:
+            status = "entry_placed_tp_sl_partial"
+        else:
+            status = "entry_placed_tp_sl_failed"
+
+        return {
+            "status": status,
+            "entry_order": entry_result,
+            "position_code": str(position_code),
+            "take_profit_order": tp_result,
+            "stop_loss_order": sl_result,
+            "errors": {
+                "take_profit": tp_error,
+                "stop_loss": sl_error,
+            },
+            "attempts": {
+                "take_profit": tp_attempts,
+                "stop_loss": sl_attempts,
+            },
+            "bracket_plan": {
+                "stop_loss_price": stop_loss,
+                "take_profit_price": take_profit,
+            },
+        }
+    except httpx.HTTPStatusError as e:
+        response_body = None
+        try:
+            response_body = e.response.json()
+        except Exception:
+            response_body = e.response.text
+        raise HTTPException(status_code=e.response.status_code, detail=response_body)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -614,16 +1015,39 @@ async def place_bot_order(request: BotOrderRequest):
         if not token:
             raise HTTPException(status_code=401, detail="No token received from login")
         
-        # Build order payload for Liquid Charts API
-        # Using accountId as the account_code if needed
+        instrument = request.instrument or request.symbol
+        if not instrument:
+            raise HTTPException(status_code=400, detail="symbol or instrument is required")
+
+        side = str(request.side or "").upper()
+        if side not in ("BUY", "SELL"):
+            raise HTTPException(status_code=400, detail="side must be BUY or SELL")
+
+        order_type = str(request.orderType or "MARKET").upper()
+        position_effect = str(request.positionEffect or "OPEN").upper()
+        tif = str(request.tif or "GTC").upper()
+
+        if position_effect == "CLOSE" and not request.positionCode:
+            raise HTTPException(status_code=400, detail="positionCode is required for CLOSE orders")
+
+        if order_type == "LIMIT":
+            if request.price is None or float(request.price) <= 0:
+                raise HTTPException(status_code=400, detail="LIMIT orders require positive price")
+
+        # Build DXSCA order payload (same schema as working account order flow)
         order_payload = {
-            "clientOrderId": f"{request.accountId}_{request.symbol}_{request.side}_{int(time.time() * 1000)}",
-            "symbol": request.symbol,
-            "side": request.side.upper(),  # BUY or SELL
-            "quantity": request.quantity,
-            "orderType": "market",  # Use market order for bot execution
-            "amount": request.amount,
+            "orderCode": request.orderCode or f"bot-{request.accountId}-{instrument}-{side}-{int(time.time() * 1000)}",
+            "instrument": instrument,
+            "side": side,
+            "type": order_type,
+            "positionEffect": position_effect,
+            "tif": tif,
+            "quantity": float(request.quantity),
         }
+        if request.price is not None:
+            order_payload["price"] = float(request.price)
+        if request.positionCode:
+            order_payload["positionCode"] = str(request.positionCode)
         
         # Place the order using the account place endpoint
         result = await LiquidChartsAPI.place_account_order(
@@ -635,7 +1059,7 @@ async def place_bot_order(request: BotOrderRequest):
         
         return {
             "success": True,
-            "orderId": result.get('id') or result.get('orderId') or result.get('clientOrderId'),
+            "orderId": result.get('id') or result.get('orderId') or result.get('orderCode') or result.get('clientOrderId'),
             "data": result
         }
     

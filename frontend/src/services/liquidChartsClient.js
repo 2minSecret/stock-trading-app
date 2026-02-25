@@ -259,10 +259,25 @@ export const liquidTrading = {
       if (!accountCode) throw new Error('accountCode is required');
       if (!order || typeof order !== 'object') throw new Error('order payload is required');
 
+      const orderType = String(order.type || order.orderType || 'MARKET').toUpperCase();
       const payload = {
-        ...order,
-        clientOrderId: order.clientOrderId || `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        orderCode: order.orderCode || order.clientOrderId || `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        type: orderType,
+        positionEffect: order.positionEffect || 'OPEN',
+        tif: order.tif || order.timeInForce || 'GTC',
+        instrument: order.instrument || order.symbol,
+        side: String(order.side || 'BUY').toUpperCase(),
+        ...(order.quantity !== undefined ? { quantity: Number(order.quantity) } : {}),
+        ...(order.price !== undefined ? { price: Number(order.price) } : {}),
+        ...(order.limitPrice !== undefined ? { price: Number(order.limitPrice) } : {}),
+        ...(order.positionCode ? { positionCode: String(order.positionCode) } : {}),
       };
+
+      if (!payload.instrument) throw new Error('instrument (or symbol) is required');
+      if (!payload.quantity || payload.quantity <= 0) throw new Error('quantity must be > 0');
+      if (payload.type === 'LIMIT' && (payload.price === undefined || !Number.isFinite(payload.price) || payload.price <= 0)) {
+        throw new Error('LIMIT orders require a positive price');
+      }
 
       const response = await liquidClient.post('/orders/account/place', {
         account_code: accountCode,
@@ -271,6 +286,25 @@ export const liquidTrading = {
       return response.data;
     } catch (error) {
       console.error('Error placing account-scoped order:', error);
+      throw error;
+    }
+  },
+
+  // MVP: place entry order and wire TP/SL payload to backend for bracket plan handling
+  async placeBracketOrder({ accountCode, entryOrder, stopLossPrice, takeProfitPrice }) {
+    try {
+      if (!accountCode) throw new Error('accountCode is required');
+      if (!entryOrder || typeof entryOrder !== 'object') throw new Error('entryOrder is required');
+
+      const response = await liquidClient.post('/orders/account/place-bracket', {
+        account_code: accountCode,
+        entry_order: entryOrder,
+        stop_loss_price: Number(stopLossPrice),
+        take_profit_price: Number(takeProfitPrice),
+      });
+      return response.data;
+    } catch (error) {
+      console.error('Error placing bracket order:', error);
       throw error;
     }
   },

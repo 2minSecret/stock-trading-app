@@ -1,17 +1,17 @@
+from dotenv import load_dotenv
+load_dotenv()  # MUST be called before importing modules that use os.getenv()
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import random
 import json
 import os
-from dotenv import load_dotenv
 
 from polygon_client import polygon_listener
 from yahoo_client import yahoo_poller
 from trading_routes import router as trading_router
 from bot_routes import router as bot_router
-
-load_dotenv()
 print("STARTUP: FastAPI app being created")
 app = FastAPI()
 print("STARTUP: FastAPI app created successfully")

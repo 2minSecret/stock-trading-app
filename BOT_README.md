@@ -8,6 +8,7 @@ Intelligent automated trading system for NAS100 with adaptive profit-taking stra
 ### ✅ Smart Trading
 - **Symbol**: NAS100 (Nasdaq 100 Index) only
 - **Window**: 09:25 - 10:00 (35-minute daily trading window)
+- **Timezone-Aware Window**: Uses device/browser timezone when starting the bot (fallback: server local timezone)
 - **Purchase**: $100 per trade
 - **Auto Stop-Loss**: Triggers at 20% loss ($20)
 
@@ -113,6 +114,10 @@ Get real-time bot status.
   "data": {
     "is_running": true,
     "state": "in_position",
+    "server_time": "2026-02-25T12:59:25.405472+02:00",
+    "config": {
+      "timezone": "Asia/Jerusalem"
+    },
     "current_position": {
       "position_id": "order-789",
       "entry_price": 15250.50,
@@ -230,11 +235,14 @@ class TradingConfig:
     stop_loss_pct: float = 0.20  # 20%
     trade_window_start: time = time(9, 25)  # 09:25
     trade_window_end: time = time(10, 0)    # 10:00
+  timezone: Optional[str] = None  # IANA TZ, e.g. "America/New_York"
     check_interval: int = 5  # seconds
     cooldown_minutes: int = 32
     profit_patience_min: int = 60   # 1 minute
     profit_patience_max: int = 180  # 3 minutes
     profit_decline_threshold: float = 0.02  # 2%
+
+When starting via frontend, `customConfig.TIMEZONE` is sent automatically from browser (`Intl.DateTimeFormat().resolvedOptions().timeZone`).
 ```
 
 ## Statistics Dashboard

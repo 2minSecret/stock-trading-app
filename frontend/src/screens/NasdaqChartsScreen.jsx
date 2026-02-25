@@ -42,20 +42,16 @@ export default function NasdaqChartsScreen() {
 
         {/* Stats Grid */}
         <div className="grid grid-cols-2 gap-3 pt-4 border-t border-cyan-800/20">
-          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30">
-            <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mb-2">24h High</p>
+          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30 flex items-center justify-center min-h-[64px]">
             <p className="text-lg font-semibold text-white">—</p>
           </div>
-          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30">
-            <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mb-2">24h Low</p>
+          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30 flex items-center justify-center min-h-[64px]">
             <p className="text-lg font-semibold text-white">—</p>
           </div>
-          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30">
-            <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mb-2">52w High</p>
+          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30 flex items-center justify-center min-h-[64px]">
             <p className="text-lg font-semibold text-white">—</p>
           </div>
-          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30">
-            <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mb-2">52w Low</p>
+          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30 flex items-center justify-center min-h-[64px]">
             <p className="text-lg font-semibold text-white">—</p>
           </div>
         </div>

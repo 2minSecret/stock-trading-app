@@ -12,7 +12,7 @@ import {
 } from 'chart.js';
 import zoomPlugin from 'chartjs-plugin-zoom';
 import { useMarketFeed } from '../hooks/MarketFeedProvider';
-import { liquidMarketData } from '../services/liquidChartsClient';
+import { yahooFinanceClient } from '../services/yahooFinanceClient';
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend, Filler, zoomPlugin);
 
@@ -28,10 +28,19 @@ const AVAILABLE_CHARTS = [
   { value: 'NFLX', label: 'Netflix' },
 ];
 
-export default function ChartsViewScreen({ tradingView, setTradingView, sessionReady = false }) {
+export default function ChartsViewScreen({
+  tradingView,
+  setTradingView,
+  sessionReady = false,
+  selectedTradeAccount = null,
+  isLiveBlocked = false,
+  onPlaceBracketOrder,
+  onPlaceTouchCloseOrder,
+}) {
   const { prices, history } = useMarketFeed();
   const chartRef = useRef(null);
   const timelineRef = useRef(null);
+  const chartContainerRef = useRef(null);
   
   // Use tradingView if passed as prop, otherwise default to NAS100
   const selectedTicker = tradingView || 'NAS100';
@@ -44,6 +53,28 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
   const [selectedTimeIndex, setSelectedTimeIndex] = useState(0);
   const [isDraggingTimeline, setIsDraggingTimeline] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isFullscreenPanelVisible, setIsFullscreenPanelVisible] = useState(true);
+  const [tradeSide, setTradeSide] = useState('BUY');
+  const [entryType, setEntryType] = useState('MARKET');
+  const [entryPrice, setEntryPrice] = useState('');
+  const [tradeQuantity, setTradeQuantity] = useState('1');
+  const [stopLossPrice, setStopLossPrice] = useState(null);
+  const [takeProfitPrice, setTakeProfitPrice] = useState(null);
+  const [showTradeLines, setShowTradeLines] = useState(false);
+  const [draggingLine, setDraggingLine] = useState(null);
+  const [isSubmittingBracket, setIsSubmittingBracket] = useState(false);
+  const [bracketStatus, setBracketStatus] = useState('');
+  const [bracketError, setBracketError] = useState('');
+  const [activePositionCode, setActivePositionCode] = useState('');
+  const [autoTouchTriggerEnabled, setAutoTouchTriggerEnabled] = useState(true);
+  const [isTouchTriggerSubmitting, setIsTouchTriggerSubmitting] = useState(false);
+  const [xViewRange, setXViewRange] = useState({ min: null, max: null });
+  const lastTouchTriggerKeyRef = useRef('');
+
+  const ZOOM_WHEEL_SPEED = 0.08;
+  const ZOOM_DRAG_THRESHOLD = 6;
+  const PAN_THRESHOLD = 2;
+  const fullscreenPanelWidth = 'min(clamp(220px, 35vw, 360px), calc(100vw - 96px))';
 
   // Helper to get display name for ticker
   const getDisplayName = (ticker) => {
@@ -108,40 +139,25 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
 
     const fetchCandles = async () => {
       try {
-        const response = await liquidMarketData.getOHLC(selectedTicker, timeframe, dataLimit);
+        const response = await yahooFinanceClient.getHistory(selectedTicker, timeframe, dataLimit);
         const normalized = normalizeCandles(response);
         if (mounted) {
           setApiHistory(normalized);
         }
       } catch (error) {
-        const status = error?.response?.status;
-        if (status === 401 || status === 403) {
-          localStorage.removeItem('liquid_session_token');
-        }
+        console.error('Error fetching Yahoo Finance history:', error);
         if (mounted) setApiHistory([]);
       }
     };
 
     const fetchQuote = async () => {
       try {
-        const response = await liquidMarketData.getMarketData(selectedTicker);
-        const extractFirst = (payload) => {
-          if (Array.isArray(payload)) return payload[0] || null;
-          if (!payload || typeof payload !== 'object') return null;
-          const keys = ['marketData', 'quotes', 'items', 'data'];
-          for (const key of keys) {
-            if (Array.isArray(payload[key])) return payload[key][0] || null;
-          }
-          for (const value of Object.values(payload)) {
-            if (Array.isArray(value)) return value[0] || null;
-          }
-          return payload;
-        };
-
+        const response = await yahooFinanceClient.getQuote(selectedTicker);
         if (mounted) {
-          setApiQuote(extractFirst(response));
+          setApiQuote(response);
         }
-      } catch {
+      } catch (error) {
+        console.error('Error fetching Yahoo Finance quote:', error);
         if (mounted) setApiQuote(null);
       }
     };
@@ -216,6 +232,21 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
   const prices_arr = candleSeries.map(p => p.close).filter((value) => Number.isFinite(value));
   const high = prices_arr.length > 0 ? Math.max(...prices_arr) : derivedPrice;
   const low = prices_arr.length > 0 ? Math.min(...prices_arr) : derivedPrice;
+  const chartTop = high * 1.002;
+  const chartBottom = low * 0.998;
+  const chartSpan = Math.max(0.000001, chartTop - chartBottom);
+  const isBuySide = tradeSide === 'BUY';
+  const currentEntryPrice = entryType === 'LIMIT' && Number(entryPrice) > 0 ? Number(entryPrice) : Number(derivedPrice || 0);
+  const linePriceToPct = (price) => {
+    if (!Number.isFinite(price)) return 50;
+    const pct = ((chartTop - price) / chartSpan) * 100;
+    return Math.max(0, Math.min(100, pct));
+  };
+  const pctToLinePrice = (pct) => {
+    const clamped = Math.max(0, Math.min(100, pct));
+    const raw = chartTop - (clamped / 100) * chartSpan;
+    return Number(raw.toFixed(2));
+  };
   const avgPrice = prices_arr.length > 0
     ? prices_arr.reduce((sum, value) => sum + value, 0) / prices_arr.length
     : derivedPrice;
@@ -227,6 +258,267 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
   const periodLabel = periodMinutes >= 60
     ? `${Math.floor(periodMinutes / 60)}h ${periodMinutes % 60}m`
     : `${periodMinutes}m`;
+
+  const initializeTradeLines = (nextSide) => {
+    if (!Number.isFinite(currentEntryPrice) || currentEntryPrice <= 0) return;
+    const sideForDefaults = nextSide || tradeSide;
+    const isBuy = sideForDefaults === 'BUY';
+    const tpDefault = isBuy
+      ? Number((currentEntryPrice * 1.01).toFixed(2))
+      : Number((currentEntryPrice * 0.99).toFixed(2));
+    const slDefault = isBuy
+      ? Number((currentEntryPrice * 0.99).toFixed(2))
+      : Number((currentEntryPrice * 1.01).toFixed(2));
+    setTakeProfitPrice(tpDefault);
+    setStopLossPrice(slDefault);
+  };
+
+  const handleArmTrade = (nextSide) => {
+    setTradeSide(nextSide);
+    setShowTradeLines(true);
+    setBracketStatus('');
+    setBracketError('');
+    setActivePositionCode('');
+    lastTouchTriggerKeyRef.current = '';
+    initializeTradeLines(nextSide);
+  };
+
+  const hideTradeLines = () => {
+    setShowTradeLines(false);
+    setActivePositionCode('');
+    setIsTouchTriggerSubmitting(false);
+    lastTouchTriggerKeyRef.current = '';
+  };
+
+  const extractPositionCode = (payload) => {
+    if (!payload || typeof payload !== 'object') return '';
+    const direct = payload.position_code || payload.positionCode;
+    if (typeof direct === 'string' && direct.trim()) return direct.trim();
+
+    const candidates = [
+      payload.entry_response,
+      payload.entry,
+      payload.tp_response,
+      payload.sl_response,
+      payload.response,
+      payload.data,
+    ];
+
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== 'object') continue;
+      const nested = candidate.position_code || candidate.positionCode;
+      if (typeof nested === 'string' && nested.trim()) return nested.trim();
+      const order = candidate.order;
+      const orderPos = order?.position_code || order?.positionCode;
+      if (typeof orderPos === 'string' && orderPos.trim()) return orderPos.trim();
+    }
+
+    return '';
+  };
+
+  const updateDraggedLine = (clientY) => {
+    if (!draggingLine || !chartContainerRef.current || !Number.isFinite(currentEntryPrice) || currentEntryPrice <= 0) return;
+    const rect = chartContainerRef.current.getBoundingClientRect();
+    const pct = ((clientY - rect.top) / rect.height) * 100;
+    const nextPrice = pctToLinePrice(pct);
+    if (draggingLine === 'tp') {
+      setTakeProfitPrice(nextPrice);
+      return;
+    }
+    setStopLossPrice(nextPrice);
+  };
+
+  useEffect(() => {
+    if (!draggingLine) return;
+    const onMove = (event) => {
+      const clientY = event.touches?.[0]?.clientY ?? event.clientY;
+      if (typeof clientY !== 'number') return;
+      updateDraggedLine(clientY);
+    };
+    const onEnd = () => setDraggingLine(null);
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onEnd);
+    window.addEventListener('touchmove', onMove, { passive: true });
+    window.addEventListener('touchend', onEnd);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onEnd);
+      window.removeEventListener('touchmove', onMove);
+      window.removeEventListener('touchend', onEnd);
+    };
+  }, [draggingLine, currentEntryPrice, isBuySide, chartTop, chartSpan]);
+
+  const handlePlaceBracket = async () => {
+    setBracketStatus('');
+    setBracketError('');
+
+    if (!selectedTradeAccount) {
+      setBracketError('Select an account before placing an order.');
+      return;
+    }
+    if (isLiveBlocked) {
+      setBracketError('Live account is blocked. Enable live trading to continue.');
+      return;
+    }
+    if (typeof onPlaceBracketOrder !== 'function') {
+      setBracketError('Trading handler is unavailable.');
+      return;
+    }
+
+    const quantity = Number(tradeQuantity);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      setBracketError('Quantity must be a positive number.');
+      return;
+    }
+    if (entryType === 'LIMIT') {
+      const value = Number(entryPrice);
+      if (!Number.isFinite(value) || value <= 0) {
+        setBracketError('Limit entry requires a positive entry price.');
+        return;
+      }
+    }
+    if (!showTradeLines || !Number.isFinite(stopLossPrice) || !Number.isFinite(takeProfitPrice)) {
+      setBracketError('Set both SL and TP lines before placing the order.');
+      return;
+    }
+
+    if (tradeSide === 'BUY' && !(stopLossPrice < currentEntryPrice && takeProfitPrice > currentEntryPrice)) {
+      setBracketError('For BUY: SL must be below entry and TP above entry.');
+      return;
+    }
+    if (tradeSide === 'SELL' && !(takeProfitPrice < currentEntryPrice && stopLossPrice > currentEntryPrice)) {
+      setBracketError('For SELL: TP must be below entry and SL above entry.');
+      return;
+    }
+
+    setIsSubmittingBracket(true);
+    try {
+      const result = await onPlaceBracketOrder({
+        side: tradeSide,
+        quantity,
+        entryType,
+        entryPrice: entryType === 'LIMIT' ? Number(entryPrice) : undefined,
+        stopLossPrice,
+        takeProfitPrice,
+        instrument: selectedTicker,
+      });
+      const resolvedPositionCode = extractPositionCode(result);
+      setActivePositionCode(resolvedPositionCode);
+      lastTouchTriggerKeyRef.current = '';
+      const status = result?.status;
+      if (status === 'entry_tp_sl_placed') {
+        setBracketStatus(`${tradeSide} bracket submitted on ${selectedTradeAccount.label} (${selectedTradeAccount.code}). TP/SL attached.${resolvedPositionCode ? ' Touch trigger armed.' : ''}`);
+      } else if (status === 'entry_placed_tp_sl_partial' || status === 'entry_placed_tp_sl_failed' || status === 'entry_placed_position_pending') {
+        setBracketStatus(`${tradeSide} entry submitted on ${selectedTradeAccount.label} (${selectedTradeAccount.code}).`);
+        const tpErr = result?.errors?.take_profit;
+        const slErr = result?.errors?.stop_loss;
+        const pendingMsg = status === 'entry_placed_position_pending' ? 'Position code not ready yet for TP/SL attach.' : '';
+        const tpMsg = tpErr ? `TP error: ${typeof tpErr === 'string' ? tpErr : (tpErr.description || JSON.stringify(tpErr))}` : '';
+        const slMsg = slErr ? `SL error: ${typeof slErr === 'string' ? slErr : (slErr.description || JSON.stringify(slErr))}` : '';
+        const joined = [pendingMsg, tpMsg, slMsg].filter(Boolean).join(' ');
+        if (joined) setBracketError(joined);
+      } else {
+        setBracketStatus(`${tradeSide} bracket submitted on ${selectedTradeAccount.label} (${selectedTradeAccount.code}).`);
+      }
+    } catch (error) {
+      const detail = error?.response?.data?.detail;
+      if (typeof detail === 'string') {
+        setBracketError(detail);
+      } else if (detail && typeof detail === 'object') {
+        setBracketError(detail.description || detail.message || 'Bracket order failed.');
+      } else {
+        setBracketError(error?.message || 'Bracket order failed.');
+      }
+    } finally {
+      setIsSubmittingBracket(false);
+    }
+  };
+
+  useEffect(() => {
+    const latestCandle = candleSeries[candleSeries.length - 1];
+    if (!latestCandle) return;
+    if (!showTradeLines || !autoTouchTriggerEnabled) return;
+    if (!activePositionCode || isSubmittingBracket || isTouchTriggerSubmitting) return;
+    if (!Number.isFinite(stopLossPrice) || !Number.isFinite(takeProfitPrice)) return;
+    if (typeof onPlaceTouchCloseOrder !== 'function') return;
+
+    const highPrice = Number(latestCandle.high);
+    const lowPrice = Number(latestCandle.low);
+    if (!Number.isFinite(highPrice) || !Number.isFinite(lowPrice)) return;
+
+    const tpTouched = tradeSide === 'BUY'
+      ? highPrice >= takeProfitPrice
+      : lowPrice <= takeProfitPrice;
+    const slTouched = tradeSide === 'BUY'
+      ? lowPrice <= stopLossPrice
+      : highPrice >= stopLossPrice;
+
+    let triggerType = '';
+    if (tpTouched) triggerType = 'TP';
+    else if (slTouched) triggerType = 'SL';
+    if (!triggerType) return;
+
+    const triggerKey = `${activePositionCode}-${latestCandle.ts}-${triggerType}`;
+    if (lastTouchTriggerKeyRef.current === triggerKey) return;
+    lastTouchTriggerKeyRef.current = triggerKey;
+
+    const quantity = Number(tradeQuantity);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      setBracketError('Touch trigger requires a valid quantity.');
+      return;
+    }
+
+    let canceled = false;
+    const submitTouchClose = async () => {
+      setIsTouchTriggerSubmitting(true);
+      try {
+        await onPlaceTouchCloseOrder({
+          positionCode: activePositionCode,
+          side: tradeSide,
+          quantity,
+          instrument: selectedTicker,
+          reason: triggerType,
+        });
+        if (canceled) return;
+        setBracketStatus(`${triggerType} touched on candle ${formatTimestampByTimeframe(latestCandle.ts, true)}. Close order sent.`);
+        setBracketError('');
+        setActivePositionCode('');
+      } catch (error) {
+        if (canceled) return;
+        const detail = error?.response?.data?.detail;
+        if (typeof detail === 'string') {
+          setBracketError(detail);
+        } else if (detail && typeof detail === 'object') {
+          setBracketError(detail.description || detail.message || `${triggerType} touch close failed.`);
+        } else {
+          setBracketError(error?.message || `${triggerType} touch close failed.`);
+        }
+      } finally {
+        if (!canceled) {
+          setIsTouchTriggerSubmitting(false);
+        }
+      }
+    };
+
+    submitTouchClose();
+    return () => {
+      canceled = true;
+    };
+  }, [
+    candleSeries,
+    showTradeLines,
+    autoTouchTriggerEnabled,
+    activePositionCode,
+    isSubmittingBracket,
+    isTouchTriggerSubmitting,
+    stopLossPrice,
+    takeProfitPrice,
+    tradeSide,
+    tradeQuantity,
+    selectedTicker,
+    onPlaceTouchCloseOrder,
+  ]);
   const navigatorWindowSize = Math.max(20, Math.round(filteredHistory.length * 0.28));
   const navigatorStartIndex = Math.max(0, Math.min(
     selectedTimeIndex - Math.floor(navigatorWindowSize / 2),
@@ -286,7 +578,7 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
       mode: 'nearest',
       intersect: true,
     },
-    events: ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove'],
+    events: ['mousemove', 'mouseout', 'click', 'mousedown', 'mouseup', 'touchstart', 'touchmove', 'touchend'],
     plugins: {
       legend: { display: false },
       tooltip: {
@@ -323,10 +615,17 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
         zoom: {
           wheel: {
             enabled: true,
-            speed: 0.05,
+            speed: ZOOM_WHEEL_SPEED,
           },
           pinch: {
-            enabled: true
+            enabled: true,
+          },
+          drag: {
+            enabled: !isPanning,
+            backgroundColor: 'rgba(6, 182, 212, 0.15)',
+            borderColor: 'rgba(6, 182, 212, 0.6)',
+            borderWidth: 1,
+            threshold: ZOOM_DRAG_THRESHOLD,
           },
           mode: 'x',
         },
@@ -334,15 +633,29 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
           enabled: isPanning,
           mode: 'x',
           modifierKey: null,
+          threshold: PAN_THRESHOLD,
         },
-        limits: {
-          x: { min: 'original', max: 'original' },
-        }
+        onZoomComplete: ({ chart }) => {
+          const scaleX = chart?.scales?.x;
+          if (!scaleX) return;
+          if (Number.isFinite(scaleX.min) && Number.isFinite(scaleX.max)) {
+            setXViewRange({ min: scaleX.min, max: scaleX.max });
+          }
+        },
+        onPanComplete: ({ chart }) => {
+          const scaleX = chart?.scales?.x;
+          if (!scaleX) return;
+          if (Number.isFinite(scaleX.min) && Number.isFinite(scaleX.max)) {
+            setXViewRange({ min: scaleX.min, max: scaleX.max });
+          }
+        },
       }
     },
     scales: {
       x: {
         display: true,
+        ...(Number.isFinite(xViewRange.min) ? { min: xViewRange.min } : {}),
+        ...(Number.isFinite(xViewRange.max) ? { max: xViewRange.max } : {}),
         grid: { 
           display: true,
           color: 'rgba(75, 85, 99, 0.1)',
@@ -374,7 +687,7 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
         }
       }
     }
-  }), [isPanning, candleSeries, low, high]);
+  }), [isPanning, candleSeries, low, high, ZOOM_WHEEL_SPEED, ZOOM_DRAG_THRESHOLD, PAN_THRESHOLD, xViewRange.min, xViewRange.max]);
 
   // Chart control functions
   const handleZoomIn = () => {
@@ -393,6 +706,7 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
     if (chartRef.current) {
       chartRef.current.resetZoom();
     }
+    setXViewRange({ min: null, max: null });
   };
 
   // Keep timeline marker at latest candle when data updates
@@ -460,6 +774,9 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
   const handleToggleFullscreen = async () => {
     const next = !isFullscreen;
     setIsFullscreen(next);
+    if (next) {
+      setIsFullscreenPanelVisible(true);
+    }
 
     if (next) {
       try {
@@ -493,12 +810,179 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
     };
   }, [isFullscreen]);
 
+  const tradeLineOverlay = (
+    <>
+      {showTradeLines && Number.isFinite(currentEntryPrice) && currentEntryPrice > 0 && (
+        <div
+          className="absolute left-0 right-0 pointer-events-none"
+          style={{ top: `${linePriceToPct(currentEntryPrice)}%` }}
+        >
+          <div className="border-t border-cyan-400/80 border-dashed" />
+          <span className="absolute right-2 -top-3 text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-200 border border-cyan-500/40">
+            Entry {currentEntryPrice.toFixed(2)}
+          </span>
+        </div>
+      )}
+
+      {showTradeLines && Number.isFinite(takeProfitPrice) && (
+        <div
+          className="absolute left-0 right-0"
+          style={{ top: `${linePriceToPct(takeProfitPrice)}%` }}
+        >
+          <button
+            type="button"
+            onMouseDown={(e) => { e.preventDefault(); setDraggingLine('tp'); }}
+            onTouchStart={(e) => { e.preventDefault(); setDraggingLine('tp'); }}
+            className="absolute left-0 right-0 -top-3 h-6 cursor-ns-resize"
+            title="Drag Take Profit"
+          />
+          <div className="border-t border-emerald-400/90" />
+          <span className="absolute right-2 -top-3 text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-200 border border-emerald-500/40">
+            TP {takeProfitPrice.toFixed(2)}
+          </span>
+        </div>
+      )}
+
+      {showTradeLines && Number.isFinite(stopLossPrice) && (
+        <div
+          className="absolute left-0 right-0"
+          style={{ top: `${linePriceToPct(stopLossPrice)}%` }}
+        >
+          <button
+            type="button"
+            onMouseDown={(e) => { e.preventDefault(); setDraggingLine('sl'); }}
+            onTouchStart={(e) => { e.preventDefault(); setDraggingLine('sl'); }}
+            className="absolute left-0 right-0 -top-3 h-6 cursor-ns-resize"
+            title="Drag Stop Loss"
+          />
+          <div className="border-t border-rose-400/90" />
+          <span className="absolute right-2 -top-3 text-[10px] px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-200 border border-rose-500/40">
+            SL {stopLossPrice.toFixed(2)}
+          </span>
+        </div>
+      )}
+    </>
+  );
+
+  const bracketPanel = (
+    <div className="bg-gray-800/20 border border-gray-700/20 rounded-lg p-3">
+      <div className="flex items-center gap-2 mb-3">
+        <button
+          type="button"
+          onClick={() => handleArmTrade('BUY')}
+          className="h-8 px-3 rounded bg-emerald-600/80 hover:bg-emerald-500 text-white text-xs font-semibold"
+        >
+          Buy
+        </button>
+        <button
+          type="button"
+          onClick={() => handleArmTrade('SELL')}
+          className="h-8 px-3 rounded bg-rose-600/80 hover:bg-rose-500 text-white text-xs font-semibold"
+        >
+          Sell
+        </button>
+        <button
+          type="button"
+          onClick={hideTradeLines}
+          className="h-8 px-3 rounded bg-gray-700/70 hover:bg-gray-600 text-white text-xs font-semibold"
+        >
+          Hide Lines
+        </button>
+      </div>
+
+      <div className={`grid gap-2 items-end ${isFullscreen ? 'grid-cols-1' : 'grid-cols-2 md:grid-cols-6'}`}>
+        <div>
+          <label className="text-[10px] text-gray-500 uppercase tracking-wider">Side</label>
+          <p className="w-full mt-1 bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs text-white">{tradeSide}</p>
+        </div>
+        <div>
+          <label className="text-[10px] text-gray-500 uppercase tracking-wider">Entry Type</label>
+          <select
+            value={entryType}
+            onChange={(e) => setEntryType(e.target.value)}
+            className="w-full mt-1 bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs text-white"
+          >
+            <option value="MARKET">MARKET</option>
+            <option value="LIMIT">LIMIT</option>
+          </select>
+        </div>
+        <div>
+          <label className="text-[10px] text-gray-500 uppercase tracking-wider">Qty</label>
+          <input
+            value={tradeQuantity}
+            onChange={(e) => setTradeQuantity(e.target.value)}
+            inputMode="decimal"
+            className="w-full mt-1 bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs text-white"
+          />
+        </div>
+        <div>
+          <label className="text-[10px] text-gray-500 uppercase tracking-wider">Entry Price</label>
+          <input
+            value={entryPrice}
+            onChange={(e) => setEntryPrice(e.target.value)}
+            inputMode="decimal"
+            disabled={entryType !== 'LIMIT'}
+            placeholder={entryType === 'LIMIT' ? 'Set price' : Number(derivedPrice || 0).toFixed(2)}
+            className="w-full mt-1 bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs text-white disabled:opacity-50"
+          />
+        </div>
+        <div>
+          <label className="text-[10px] text-gray-500 uppercase tracking-wider">TP / SL</label>
+          <p className="mt-2 text-xs text-gray-300">{Number(takeProfitPrice || 0).toFixed(2)} / {Number(stopLossPrice || 0).toFixed(2)}</p>
+        </div>
+        <button
+          type="button"
+          onClick={handlePlaceBracket}
+          disabled={isSubmittingBracket || !sessionReady || !showTradeLines}
+          className="h-8 w-full rounded bg-cyan-600/80 hover:bg-cyan-500 text-white text-xs font-semibold disabled:opacity-50"
+        >
+          {isSubmittingBracket ? 'Submitting...' : 'Place Bracket'}
+        </button>
+      </div>
+
+      <div className="mt-3 flex items-center gap-2">
+        <input
+          id="touch-trigger-toggle"
+          type="checkbox"
+          checked={autoTouchTriggerEnabled}
+          onChange={(e) => setAutoTouchTriggerEnabled(e.target.checked)}
+          className="h-3.5 w-3.5 rounded border-gray-600 bg-gray-900 text-cyan-500"
+        />
+        <label htmlFor="touch-trigger-toggle" className="text-xs text-gray-300">
+          Auto close when candle touches TP/SL
+        </label>
+      </div>
+
+      {!showTradeLines && (
+        <p className="mt-2 text-xs text-gray-400">Click Buy or Sell to show draggable TP/SL lines on chart.</p>
+      )}
+
+      {showTradeLines && !activePositionCode && (
+        <p className="mt-2 text-xs text-gray-500">Touch trigger activates after bracket entry returns a position code.</p>
+      )}
+
+      {showTradeLines && !!activePositionCode && (
+        <p className="mt-2 text-xs text-cyan-300">Touch trigger armed for position {activePositionCode}.</p>
+      )}
+
+      {isTouchTriggerSubmitting && (
+        <p className="mt-2 text-xs text-cyan-300">Submitting touch-trigger close order...</p>
+      )}
+
+      {selectedTradeAccount && (
+        <p className="mt-2 text-[10px] text-gray-500">Account: {selectedTradeAccount.label} ({selectedTradeAccount.code})</p>
+      )}
+      {!!bracketStatus && <p className="mt-2 text-xs text-emerald-400">{bracketStatus}</p>}
+      {!!bracketError && <p className="mt-2 text-xs text-rose-400">{bracketError}</p>}
+    </div>
+  );
+
   if (isFullscreen) {
     return (
-      <div className="fixed inset-0 z-50 bg-gray-950 w-screen h-screen max-w-none px-4 py-3 flex flex-col">
-        <div className="mb-3 space-y-2">
-          <div className="flex items-center justify-between">
-            <div className="flex gap-2 flex-wrap">
+      <div className="fixed inset-0 z-50 bg-gray-950 p-3 flex flex-col overflow-hidden box-border">
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <div className="flex-1 min-w-[220px] overflow-x-auto">
+            <div className="flex gap-2 flex-nowrap min-w-max">
               {['1m', '2m', '5m', '1h', '1d', '1w'].map(tf => (
                 <button
                   key={tf}
@@ -513,56 +997,158 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
                 </button>
               ))}
             </div>
+          </div>
+
+          <div className="hidden md:flex items-center gap-2 bg-gray-900/50 border border-gray-700/40 rounded-lg px-3 py-1.5">
+            <span className="text-xs text-gray-400">{selectedTicker}</span>
+            <span className="text-sm font-semibold text-white">${Number(derivedPrice || 0).toFixed(2)}</span>
+            <span className={`text-xs font-semibold ${isPositive ? 'text-cyan-400' : 'text-red-400'}`}>
+              {isPositive ? '↑' : '↓'} {Math.abs(pct).toFixed(2)}%
+            </span>
+          </div>
+
+          <div className="flex gap-1 items-center bg-gray-900/70 rounded-lg p-0.5 border border-gray-700/40 backdrop-blur-sm ml-auto">
             <button
-              onClick={handleToggleFullscreen}
-              className="inline-flex items-center gap-2 text-xs font-semibold px-3 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 transition"
+              onClick={handleZoomIn}
+              className="p-2 rounded-md active:bg-gray-700/70 transition text-cyan-400"
+              title="Zoom In"
             >
-              <Minimize2 size={14} />
-              Exit Fullscreen
+              <ZoomIn size={16} />
+            </button>
+            <button
+              onClick={handleZoomOut}
+              className="p-2 rounded-md active:bg-gray-700/70 transition text-cyan-400"
+              title="Zoom Out"
+            >
+              <ZoomOut size={16} />
+            </button>
+            <button
+              onClick={handleResetZoom}
+              className="p-2 rounded-md active:bg-gray-700/70 transition text-orange-400"
+              title="Reset"
+            >
+              <RotateCcw size={16} />
+            </button>
+            <button
+              onClick={() => setIsPanning(!isPanning)}
+              className={`p-2 rounded-md active:bg-gray-700/70 transition ${
+                isPanning ? 'text-green-400 bg-green-500/20' : 'text-gray-400'
+              }`}
+              title={isPanning ? 'Drag: ON' : 'Drag: OFF'}
+            >
+              <Move size={16} />
             </button>
           </div>
 
-          <div className="flex gap-2 items-center justify-between">
-            <div className="flex gap-1 items-center bg-gray-800/30 rounded-lg p-0.5 border border-gray-700/30">
-              <button
-                onClick={handleZoomIn}
-                className="p-2 rounded-md active:bg-gray-700/70 transition text-cyan-400"
-                title="Zoom In"
-              >
-                <ZoomIn size={18} />
-              </button>
-              <button
-                onClick={handleZoomOut}
-                className="p-2 rounded-md active:bg-gray-700/70 transition text-cyan-400"
-                title="Zoom Out"
-              >
-                <ZoomOut size={18} />
-              </button>
-              <button
-                onClick={handleResetZoom}
-                className="p-2 rounded-md active:bg-gray-700/70 transition text-orange-400"
-                title="Reset"
-              >
-                <RotateCcw size={18} />
-              </button>
-            </div>
-
-            <div className="flex gap-1 items-center bg-gray-800/30 rounded-lg p-0.5 border border-gray-700/30">
-              <button
-                onClick={() => setIsPanning(!isPanning)}
-                className={`p-2 rounded-md active:bg-gray-700/70 transition ${
-                  isPanning ? 'text-green-400 bg-green-500/20' : 'text-gray-400'
-                }`}
-                title={isPanning ? 'Drag: ON' : 'Drag: OFF'}
-              >
-                <Move size={18} />
-              </button>
-            </div>
-          </div>
+          <button
+            onClick={handleToggleFullscreen}
+            className="inline-flex items-center gap-2 text-xs font-semibold px-3 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 transition ml-auto sm:ml-0"
+          >
+            <Minimize2 size={14} />
+            Exit Fullscreen
+          </button>
         </div>
 
-        <div className="mb-4 touch-none flex-1">
-          <Bar ref={chartRef} data={chartData} options={chartOptions} />
+        <div className="mb-2 bg-gray-900/40 border border-gray-700/30 rounded-lg px-2.5 py-1.5">
+          <p className="text-[11px] text-gray-400">
+            Tip: Pinch/wheel to zoom • {isPanning ? 'Drag to pan' : 'Enable Move to pan'} • Use panel toggle on seam
+          </p>
+        </div>
+
+        <div className="flex-1 min-h-0 min-w-0 flex gap-3 relative">
+          <div className="flex-1 min-h-0 min-w-0 flex flex-col gap-2">
+            <div ref={chartContainerRef} className="touch-none flex-1 relative min-h-0">
+              <Bar ref={chartRef} data={chartData} options={chartOptions} />
+              {tradeLineOverlay}
+            </div>
+
+            <div className="bg-gray-900/40 rounded-lg border border-gray-700/30 p-2">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[10px] font-semibold text-gray-400 uppercase">Navigator</span>
+                <span className="text-xs font-mono text-cyan-400">
+                  {filteredHistory.length > 0 && selectedTimeIndex < filteredHistory.length
+                    ? formatTimestampByTimeframe(filteredHistory[selectedTimeIndex].ts, true)
+                    : 'No data'}
+                </span>
+              </div>
+
+              <div
+                ref={timelineRef}
+                onMouseDown={handleTimelineDragStart}
+                onTouchStart={handleTimelineDragStart}
+                className={`relative h-10 bg-gray-900/70 border border-gray-700/40 rounded-lg overflow-hidden transition ${
+                  isPanning ? 'cursor-pointer' : 'cursor-not-allowed opacity-80'
+                } ${
+                  isDraggingTimeline ? 'border-cyan-500/70' : 'hover:border-cyan-500/40'
+                }`}
+                style={{ userSelect: 'none' }}
+              >
+                <div className="absolute inset-0 flex items-end px-0 gap-0 pointer-events-none">
+                  {filteredHistory.map((point, index) => {
+                    const prevPoint = index > 0 ? filteredHistory[index - 1] : point;
+                    const directionUp = point.price >= prevPoint.price;
+                    const height = high > low
+                      ? Math.max(10, ((point.price - low) / (high - low)) * 100)
+                      : 30;
+                    return (
+                      <div
+                        key={`full-nav-${point.ts}-${index}`}
+                        className="flex-1"
+                        style={{
+                          height: `${height}%`,
+                          backgroundColor: directionUp ? 'rgba(59, 130, 246, 0.55)' : 'rgba(239, 68, 68, 0.55)',
+                        }}
+                      />
+                    );
+                  })}
+                </div>
+
+                <div className="absolute inset-y-0 left-0 bg-gray-950/55 pointer-events-none" style={{ width: `${navigatorStartPct}%` }} />
+                <div
+                  className="absolute inset-y-0 bg-cyan-500/10 border-y border-cyan-400/60 pointer-events-none"
+                  style={{ left: `${navigatorStartPct}%`, width: `${navigatorWidthPct}%` }}
+                />
+                <div
+                  className="absolute inset-y-0 right-0 bg-gray-950/55 pointer-events-none"
+                  style={{ width: `${Math.max(0, 100 - navigatorStartPct - navigatorWidthPct)}%` }}
+                />
+              </div>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setIsFullscreenPanelVisible((prev) => !prev)}
+            className={`absolute top-16 z-30 h-9 w-7 rounded-l-full border border-r-0 border-gray-600/50 bg-gray-900/85 text-gray-300 hover:bg-gray-800/90 hover:text-white transition-all duration-300 backdrop-blur-sm ${
+              isFullscreenPanelVisible ? 'opacity-100' : 'opacity-60'
+            }`}
+            style={{ right: isFullscreenPanelVisible ? fullscreenPanelWidth : '0px' }}
+            title={isFullscreenPanelVisible ? 'Hide trading panel' : 'Show trading panel'}
+          >
+            {isFullscreenPanelVisible ? '›' : '‹'}
+          </button>
+
+          <div
+            className="relative shrink-0 transition-all duration-300 ease-in-out"
+            style={{
+              width: isFullscreenPanelVisible ? fullscreenPanelWidth : '0px',
+              minWidth: isFullscreenPanelVisible ? '220px' : '0px',
+              maxWidth: isFullscreenPanelVisible ? fullscreenPanelWidth : '0px',
+              overflow: 'visible',
+            }}
+          >
+            <div
+              className={`absolute top-0 right-0 h-full transition-all duration-300 ease-in-out ${isFullscreenPanelVisible ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}
+              style={{
+                width: fullscreenPanelWidth,
+                transform: isFullscreenPanelVisible ? 'translateX(0px)' : 'translateX(calc(100% + 10px))',
+              }}
+            >
+              <div className="h-full overflow-y-auto pr-1">
+                {bracketPanel}
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     );
@@ -696,8 +1282,9 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
         </div>
 
         {/* Chart */}
-        <div style={{ height: '280px' }} className="mb-4 touch-none">
+        <div ref={chartContainerRef} style={{ height: '280px' }} className="mb-4 touch-none relative">
           <Bar ref={chartRef} data={chartData} options={chartOptions} />
+          {tradeLineOverlay}
         </div>
 
         {/* Liquid-style Timeline Navigator */}
@@ -776,20 +1363,16 @@ export default function ChartsViewScreen({ tradingView, setTradingView, sessionR
 
         {/* Stats Grid */}
         <div className="grid grid-cols-2 gap-3 pt-4 border-t border-gray-800/30">
-          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30">
-            <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mb-2">Period High</p>
+          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30 flex items-center justify-center min-h-[64px]">
             <p className="text-lg font-semibold text-cyan-400">${high.toFixed(2)}</p>
           </div>
-          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30">
-            <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mb-2">Period Low</p>
+          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30 flex items-center justify-center min-h-[64px]">
             <p className="text-lg font-semibold text-red-400">${low.toFixed(2)}</p>
           </div>
-          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30">
-            <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mb-2">Data Points</p>
+          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30 flex items-center justify-center min-h-[64px]">
             <p className="text-lg font-semibold text-white">{filteredHistory.length}</p>
           </div>
-          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30">
-            <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mb-2">Volatility</p>
+          <div className="bg-gray-800/30 rounded-lg p-3 border border-gray-700/30 flex items-center justify-center min-h-[64px]">
             <p className="text-lg font-semibold text-white">
               {low ? (((high - low) / low) * 100).toFixed(2) : '0.00'}%
             </p>

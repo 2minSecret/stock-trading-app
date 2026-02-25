@@ -10,12 +10,12 @@ import ChartsViewScreen from './screens/ChartsViewScreen';
 import NotificationsScreen from './screens/NotificationsScreen';
 import LoginScreen from './screens/LoginScreen';
 import SettingsPanel from './components/SettingsPanel';
-import { liquidAccount, liquidAuth, liquidTrading, liquidMarketData } from './services/liquidChartsClient';
+import { liquidAccount, liquidAuth, liquidTrading } from './services/liquidChartsClient';
+import { yahooFinanceClient } from './services/yahooFinanceClient';
 import { useMarketFeed } from './hooks/MarketFeedProvider';
 
 const DEFAULT_TRADE_ACCOUNTS = [
-  { code: 'DEMO-ACCOUNT', label: 'Demo Account', mode: 'demo' },
-  { code: 'LIVE-ACCOUNT', label: 'Live Account', mode: 'live' },
+  { code: 'default:DEM_3063067_1', label: 'Demo Account', mode: 'demo' },
 ];
 
 function loadTradeAccounts() {
@@ -376,27 +376,17 @@ function App() {
       if (haltPolling) return;
 
       try {
-        const response = await liquidMarketData.getMarketData(selectedTicker);
-        const first = extractFirstRecord(response, ['marketData', 'quotes', 'items', 'data']);
+        const response = await yahooFinanceClient.getQuote(selectedTicker);
         if (mounted) {
-          setMarketQuote(first);
+          setMarketQuote(response);
           if (accountDataError === 'Market data unavailable for selected instrument.') {
             setAccountDataError('');
           }
         }
       } catch (error) {
-        const status = error?.response?.status;
-        if (status === 401 || status === 403) {
-          localStorage.removeItem('liquid_session_token');
-          if (mounted) {
-            setSessionExpired(true);
-            setAccountDataError('Session expired. Please sign in again to continue.');
-          }
-        } else if (status === 400) {
-          haltPolling = true;
-          if (mounted) {
-            setAccountDataError('Market data unavailable for selected instrument.');
-          }
+        console.error('Error fetching Yahoo Finance quote:', error);
+        if (mounted) {
+          setMarketQuote(null);
         }
         if (mounted) {
           setMarketQuote(null);
@@ -670,6 +660,108 @@ function App() {
     }
   };
 
+  const handlePlaceBracketOrder = useCallback(async ({ side, quantity, entryType, entryPrice, stopLossPrice, takeProfitPrice, instrument }) => {
+    if (!selectedTradeAccount) {
+      throw new Error('Select an account before placing an order.');
+    }
+
+    if (isSelectedAccountPlaceholder && isLiveAccountSelected) {
+      throw new Error('Live trading requires a real Liquid account code. Select a real account before placing an order.');
+    }
+
+    if (isLiveAccountSelected && !liveTradingEnabled) {
+      throw new Error('Live account is blocked. Enable live trading explicitly to continue.');
+    }
+
+    const normalizedSide = String(side || 'BUY').toUpperCase();
+    const normalizedType = String(entryType || 'MARKET').toUpperCase();
+    const normalizedQuantity = Number(quantity);
+    const normalizedSL = Number(stopLossPrice);
+    const normalizedTP = Number(takeProfitPrice);
+    const normalizedEntryPrice = entryPrice === undefined || entryPrice === null || entryPrice === ''
+      ? undefined
+      : Number(entryPrice);
+
+    if (!instrument) throw new Error('Instrument is required.');
+    if (!Number.isFinite(normalizedQuantity) || normalizedQuantity <= 0) throw new Error('Quantity must be > 0.');
+    if (!Number.isFinite(normalizedSL) || normalizedSL <= 0) throw new Error('Stop loss must be > 0.');
+    if (!Number.isFinite(normalizedTP) || normalizedTP <= 0) throw new Error('Take profit must be > 0.');
+    if (normalizedType === 'LIMIT' && (!Number.isFinite(normalizedEntryPrice) || normalizedEntryPrice <= 0)) {
+      throw new Error('Limit entry requires a positive entry price.');
+    }
+
+    const entryOrder = {
+      instrument,
+      side: normalizedSide,
+      type: normalizedType,
+      quantity: normalizedQuantity,
+      tif: 'GTC',
+      positionEffect: 'OPEN',
+      ...(normalizedType === 'LIMIT' ? { price: normalizedEntryPrice } : {}),
+    };
+
+    const result = await liquidTrading.placeBracketOrder({
+      accountCode: selectedTradeAccount.code,
+      entryOrder,
+      stopLossPrice: normalizedSL,
+      takeProfitPrice: normalizedTP,
+    });
+
+    await refreshAccountViews();
+    return result;
+  }, [
+    selectedTradeAccount,
+    isSelectedAccountPlaceholder,
+    isLiveAccountSelected,
+    liveTradingEnabled,
+    refreshAccountViews,
+  ]);
+
+  const handlePlaceTouchCloseOrder = useCallback(async ({ positionCode, side, quantity, instrument }) => {
+    if (!selectedTradeAccount) {
+      throw new Error('Select an account before placing an order.');
+    }
+
+    if (isSelectedAccountPlaceholder && isLiveAccountSelected) {
+      throw new Error('Live trading requires a real Liquid account code. Select a real account before placing an order.');
+    }
+
+    if (isLiveAccountSelected && !liveTradingEnabled) {
+      throw new Error('Live account is blocked. Enable live trading explicitly to continue.');
+    }
+
+    const normalizedSide = String(side || 'BUY').toUpperCase();
+    const normalizedQuantity = Number(quantity);
+
+    if (!positionCode) throw new Error('Position code is required to close the trade.');
+    if (!instrument) throw new Error('Instrument is required.');
+    if (!Number.isFinite(normalizedQuantity) || normalizedQuantity <= 0) throw new Error('Quantity must be > 0.');
+
+    const closeSide = normalizedSide === 'BUY' ? 'SELL' : 'BUY';
+
+    const result = await liquidTrading.placeAccountOrder({
+      accountCode: selectedTradeAccount.code,
+      order: {
+        instrument,
+        side: closeSide,
+        type: 'MARKET',
+        quantity: normalizedQuantity,
+        tif: 'GTC',
+        positionEffect: 'CLOSE',
+        positionCode,
+      },
+    });
+
+    await refreshAccountViews();
+    return result;
+  }, [
+    selectedTradeAccount,
+    isSelectedAccountPlaceholder,
+    isLiveAccountSelected,
+    liveTradingEnabled,
+    refreshAccountViews,
+  ]);
+
   const handleModifyOrder = async () => {
     setOrderStatus('');
     setOrderError('');
@@ -849,9 +941,6 @@ function App() {
          <div className="text-center">
             <p className="text-xs text-gray-500 font-medium tracking-wider uppercase">Welcome back</p>
             <h1 className="text-sm font-semibold text-white mt-0.5">{currentUser?.name || 'Trader'}</h1>
-          <span className={`inline-block mt-1 text-[10px] font-semibold px-2 py-0.5 rounded border ${feedStatusClass}`}>
-            Feed: {feedStatusLabel}
-          </span>
          </div>
          <div className="flex items-center gap-1.5">
            <button
@@ -885,20 +974,10 @@ function App() {
              {/* Portfolio Balance */}
              <section className="mt-3 flex justify-between items-start gap-4">
                <div className="flex-1">
-                 <div className="flex items-center gap-2 mb-2">
-                   <p className="text-xs text-gray-500 font-medium uppercase tracking-wider">Account Balance</p>
-                   <span className={`text-[10px] font-semibold px-2 py-0.5 rounded border ${metricsStatusClass}`}>
-                     {metricsStatus}
-                   </span>
-                 </div>
+                 <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mb-2">Account Balance</p>
                  <h2 className="text-3xl font-bold tracking-tight text-white">
                    {convertedAccountBalance !== null ? `$${convertedAccountBalance.toFixed(2)} ${displayCurrency}` : '$—'}
                  </h2>
-                 <p className={`text-xs font-medium mt-1 ${convertedLivePnl !== null && convertedLivePnl < 0 ? 'text-red-400' : 'text-cyan-500'}`}>
-                   {convertedLivePnl !== null
-                     ? `${convertedLivePnl >= 0 ? '↑' : '↓'} $${Math.abs(convertedLivePnl).toFixed(2)} ${displayCurrency}${livePnlPct !== null ? ` (${livePnlPct.toFixed(2)}%)` : ''}`
-                     : 'Waiting for live metrics'}
-                 </p>
                  {metricsCurrency && metricsCurrency !== displayCurrency && (
                    <p className="text-[10px] text-gray-500 mt-1">
                      Converted from {metricsCurrency} at {conversionRate.toFixed(6)}
@@ -910,7 +989,6 @@ function App() {
                </div>
                {/* Trading Views Selector Combobox */}
                <div className="flex flex-col items-end">
-                 <label className="text-xs text-gray-500 font-medium uppercase tracking-wider mb-2">Instrument:</label>
                  <select
                    value={tradingView}
                    onChange={(e) => {
@@ -967,45 +1045,8 @@ function App() {
                 </div>
 
                 {/* Live chart */}
-                <LiveChart ticker={selectedTicker} timeframe={timeframe} height={160} sessionReady={sessionReady} />
-
-                {/* Account Selector + Safety Guard */}
-                <div className="rounded-xl border border-gray-800/40 bg-gray-900/40 p-3 space-y-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <p className="text-[11px] uppercase tracking-wider text-gray-500 font-semibold">Execution Account</p>
-                      <p className="text-xs text-gray-400 mt-1">Choose where orders are submitted.</p>
-                    </div>
-                    <span className={`text-[10px] font-semibold px-2 py-0.5 rounded border ${isLiveAccountSelected ? 'text-red-400 border-red-500/40 bg-red-500/10' : 'text-cyan-400 border-cyan-500/40 bg-cyan-500/10'}`}>
-                      {isLiveAccountSelected ? 'LIVE' : 'DEMO'}
-                    </span>
-                  </div>
-
-                  <select
-                    value={selectedAccountCode}
-                    onChange={(e) => setSelectedAccountCode(e.target.value)}
-                    className="w-full bg-gray-800/40 border border-gray-700/50 text-white text-xs rounded-lg px-3 py-2 cursor-pointer hover:border-cyan-500/50 focus:border-cyan-500 focus:outline-none transition duration-200 font-medium"
-                  >
-                    {tradeAccounts.map((account) => (
-                      <option key={account.code} value={account.code}>
-                        {account.label} ({account.code})
-                      </option>
-                    ))}
-                  </select>
-
-                  <label className="flex items-center gap-2 text-xs text-gray-300">
-                    <input
-                      type="checkbox"
-                      checked={liveTradingEnabled}
-                      onChange={(e) => setLiveTradingEnabled(e.target.checked)}
-                      className="accent-red-500"
-                    />
-                    Enable LIVE trading (off by default)
-                  </label>
-
-                  {isLiveBlocked && (
-                    <p className="text-xs text-amber-400">Live account selected, but safety lock is active. Turn on “Enable LIVE trading” to allow order submission.</p>
-                  )}
+                <div className="rounded-xl border border-gray-700/40 bg-gray-950/40 p-2">
+                  <LiveChart ticker={selectedTicker} timeframe={timeframe} height={160} sessionReady={sessionReady} />
                 </div>
 
                 {/* Action Buttons */}
@@ -1187,6 +1228,10 @@ function App() {
             tradingView={tradingView}
             setTradingView={setTradingView}
             sessionReady={sessionReady}
+            selectedTradeAccount={selectedTradeAccount}
+            isLiveBlocked={isLiveBlocked}
+            onPlaceBracketOrder={handlePlaceBracketOrder}
+            onPlaceTouchCloseOrder={handlePlaceTouchCloseOrder}
           />
         )}
        </main>

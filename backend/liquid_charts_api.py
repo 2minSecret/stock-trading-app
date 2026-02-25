@@ -23,6 +23,7 @@ LIQUID_API_BASE = os.getenv("LIQUID_API_URL", "https://api.liquidcharts.com/v1")
 LIQUID_API_KEY = os.getenv("LIQUID_API_KEY")
 LIQUID_API_SECRET = os.getenv("LIQUID_API_SECRET")
 LIQUID_METRICS_BASE = os.getenv("LIQUID_METRICS_BASE_URL", "https://api.liquidcharts.com")
+LIQUID_ORDER_BASE = os.getenv("LIQUID_ORDER_BASE_URL", "https://trader.liquidcharts.com")
 LIQUID_BASIC_AUTH_HEADER = os.getenv("LIQUID_BASIC_AUTH_HEADER", "Authorization")
 LIQUID_BASIC_AUTH_PREFIX = os.getenv("LIQUID_BASIC_AUTH_PREFIX", "")
 
@@ -46,6 +47,186 @@ def get_client():
 
 class LiquidChartsAPI:
     """Liquid Charts API Client"""
+
+    @staticmethod
+    def _error_mentions_eventtypes(response: httpx.Response) -> bool:
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                description = str(payload.get("description", ""))
+                return "eventtypes" in description.lower()
+        except Exception:
+            pass
+
+        text = response.text or ""
+        return "eventtypes" in text.lower()
+
+    @staticmethod
+    def _marketdata_payload_variants(request_payload: Dict[str, Any]) -> list[Dict[str, Any]]:
+        """Build compatible payload variants for dxsca-web/marketdata.
+        
+        The upstream API is very strict. We try progressively different payloads.
+        Key variations:
+        - Use eventTypes (required field)
+        - Try symbols array vs symbol string
+        - Drop extra fields (limit, market, timeframe)
+        """
+        base = dict(request_payload)
+        request_type = str(base.get("type") or "").strip().lower()
+
+        # Remove unrecognized fields that might cause <null> errors
+        base.pop("type", None)
+        
+        # Get the symbol(s)
+        symbols = base.get("symbols")
+        symbol_str = None
+        if isinstance(symbols, list) and symbols:
+            symbol_str = str(symbols[0]).strip()
+        elif isinstance(symbols, str):
+            symbol_str = str(symbols).strip()
+        
+        # Fields that might not be recognized: market, limit, timeframe
+        # Test without them first
+        all_fields_payload = dict(base)
+        
+        # Build variants: try with all fields first, then drop potentially problematic ones
+        variants: list[Dict[str, Any]] = []
+        
+        if request_type == "candles":
+            # Variant 1: Full payload with symbols array + eventTypes array
+            v1 = dict(all_fields_payload)
+            v1["eventTypes"] = ["CANDLE"]
+            variants.append(v1)
+            
+            # Variant 2: Full payload with symbols array + eventTypes string
+            v2 = dict(all_fields_payload)
+            v2["eventTypes"] = "CANDLE"
+            variants.append(v2)
+            
+            # Variant 3: Try symbol (singular) string instead of symbols array
+            if symbol_str:
+                v3 = dict(all_fields_payload)
+                v3.pop("symbols", None)
+                v3["symbol"] = symbol_str
+                v3["eventTypes"] = ["CANDLE"]
+                variants.append(v3)
+                
+                # Variant 4: symbol string + eventTypes as string
+                v4 = dict(all_fields_payload)
+                v4.pop("symbols", None)
+                v4["symbol"] = symbol_str
+                v4["eventTypes"] = "CANDLE"
+                variants.append(v4)
+            
+            # Variant 5: Minimal symbols array - only symbols and eventTypes
+            v5 = dict(all_fields_payload)
+            v5.pop("limit", None)
+            v5.pop("market", None)
+            v5.pop("timeframe", None)
+            v5["eventTypes"] = ["CANDLE"]
+            variants.append(v5)
+            
+            # Variant 6: Minimal symbol string - only symbol and eventTypes
+            if symbol_str:
+                v6 = {
+                    "symbol": symbol_str,
+                    "eventTypes": ["CANDLE"]
+                }
+                variants.append(v6)
+            
+            # Variant 7: Try CANDLES (plural) with symbol string
+            if symbol_str:
+                v7 = {
+                    "symbol": symbol_str,
+                    "eventTypes": ["CANDLES"]
+                }
+                variants.append(v7)
+            
+            # Variant 8: Try with only symbol and eventTypes (minimal)
+            if symbol_str:
+                v8 = {
+                    "symbols": [symbol_str],
+                    "eventTypes": ["CANDLE"]
+                }
+                variants.append(v8)
+            
+            # Variant 9: Try with 'type' field included explicitly
+            v9 = {
+                "symbols": [symbol_str] if symbol_str else [],
+                "type": "candles",
+                "eventTypes": ["CANDLE"]
+            }
+            if v9.get("symbols"):
+                variants.append(v9)
+            
+        elif request_type == "quote":
+            # Variant 1: Full payload with symbols array + eventTypes array
+            v1 = dict(all_fields_payload)
+            v1["eventTypes"] = ["QUOTE"]
+            variants.append(v1)
+            
+            # Variant 2: Full payload with symbols array + eventTypes string
+            v2 = dict(all_fields_payload)
+            v2["eventTypes"] = "QUOTE"
+            variants.append(v2)
+            
+            # Variant 3: Try symbol (singular) string
+            if symbol_str:
+                v3 = dict(all_fields_payload)
+                v3.pop("symbols", None)
+                v3["symbol"] = symbol_str
+                v3["eventTypes"] = ["QUOTE"]
+                variants.append(v3)
+                
+                # Variant 4: symbol string + eventTypes string
+                v4 = dict(all_fields_payload)
+                v4.pop("symbols", None)
+                v4["symbol"] = symbol_str
+                v4["eventTypes"] = "QUOTE"
+                variants.append(v4)
+            
+            # Variant 5: Minimal symbols array
+            v5 = dict(all_fields_payload)
+            v5.pop("limit", None)
+            v5.pop("market", None)
+            v5.pop("timeframe", None)
+            v5["eventTypes"] = ["QUOTE"]
+            variants.append(v5)
+            
+            # Variant 6: Minimal symbol string
+            if symbol_str:
+                v6 = {
+                    "symbol": symbol_str,
+                    "eventTypes": ["QUOTE"]
+                }
+                variants.append(v6)
+            
+            # Variant 7: Try QUOTES (plural)
+            if symbol_str:
+                v7 = {
+                    "symbol": symbol_str,
+                    "eventTypes": ["QUOTES"]
+                }
+                variants.append(v7)
+            
+            # Variant 8: Minimal with symbols array
+            v8 = {
+                "symbols": [symbol_str] if symbol_str else [],
+                "eventTypes": ["QUOTE"]
+            }
+            if v8.get("symbols"):
+                variants.append(v8)
+            
+            # Variant 9: Try with 'type' field included explicitly
+            v9 = {
+                "symbols": [symbol_str] if symbol_str else [],
+                "type": "quote",
+                "eventTypes": ["QUOTE"]
+            }
+            if v9.get("symbols"):
+                variants.append(v9)
+        
+        return variants if variants else [all_fields_payload]
 
     @staticmethod
     def _basic_headers(token: str) -> Dict[str, Any]:
@@ -147,10 +328,10 @@ class LiquidChartsAPI:
     async def basic_logout(token: str) -> Dict[str, Any]:
         """Logout from Basic Auth session"""
         try:
-            response = await LiquidChartsAPI._dxsca_request_with_basic_retry(
-                "POST",
+            headers = {"Authorization": f"DXAPI {token}", "X-Liquid-Token": token}
+            response = await get_client().post(
                 f"{LIQUID_METRICS_BASE}/dxsca-web/logout",
-                token=token,
+                headers=headers,
             )
             response.raise_for_status()
             return response.json()
@@ -162,10 +343,10 @@ class LiquidChartsAPI:
     async def basic_ping(token: str) -> Dict[str, Any]:
         """Keep Basic Auth session alive"""
         try:
-            response = await LiquidChartsAPI._dxsca_request_with_basic_retry(
-                "POST",
+            headers = {"Authorization": f"DXAPI {token}", "X-Liquid-Token": token}
+            response = await get_client().post(
                 f"{LIQUID_METRICS_BASE}/dxsca-web/ping",
-                token=token,
+                headers=headers,
             )
             response.raise_for_status()
             return response.json()
@@ -201,22 +382,53 @@ class LiquidChartsAPI:
         """Request current or historical market data via dxsca-web/marketdata."""
         try:
             print(f"DEBUG: post_market_data payload: {json.dumps(request_payload)}")
-            if auth_type == "basic" and token:
-                response = await LiquidChartsAPI._dxsca_request_with_basic_retry(
-                    "POST",
-                    f"{LIQUID_METRICS_BASE}/dxsca-web/marketdata",
-                    token=token,
-                    json_body=request_payload,
-                )
-            else:
-                headers = LiquidChartsAPI._auth_headers(token, auth_type)
-                response = await get_client().post(
-                    f"{LIQUID_METRICS_BASE}/dxsca-web/marketdata",
-                    json=request_payload,
-                    headers=headers,
-                )
-            response.raise_for_status()
-            return response.json()
+            variants = LiquidChartsAPI._marketdata_payload_variants(request_payload)
+            last_error: Optional[httpx.HTTPStatusError] = None
+
+            for index, payload_variant in enumerate(variants):
+                try:
+                    print(f"DEBUG: Trying marketdata variant #{index + 1}: {json.dumps(payload_variant)}")
+                    if auth_type == "basic" and token:
+                        response = await LiquidChartsAPI._dxsca_request_with_basic_retry(
+                            "POST",
+                            f"{LIQUID_METRICS_BASE}/dxsca-web/marketdata",
+                            token=token,
+                            json_body=payload_variant,
+                        )
+                    else:
+                        headers = LiquidChartsAPI._auth_headers(token, auth_type)
+                        response = await get_client().post(
+                            f"{LIQUID_METRICS_BASE}/dxsca-web/marketdata",
+                            json=payload_variant,
+                            headers=headers,
+                        )
+                    response.raise_for_status()
+                    if index > 0:
+                        print(f"INFO: marketdata succeeded with compatibility payload variant #{index + 1}")
+                    return response.json()
+                except httpx.HTTPStatusError as e:
+                    last_error = e
+                    # Retry on 400 errors that indicate request format issues
+                    # (eventTypes errors, parameter validation errors, etc.)
+                    is_param_error = (
+                        e.response.status_code == 400
+                        and index < len(variants) - 1
+                    )
+                    if is_param_error:
+                        try:
+                            error_body = e.response.json()
+                            description = str(error_body.get("detail", {}).get("upstream", {}).get("description", ""))
+                        except:
+                            description = str(e.response.text)[:200]
+                        print(
+                            f"WARN: marketdata variant #{index + 1} rejected ({description}); retrying variant #{index + 2}"
+                        )
+                        continue
+                    raise
+
+            if last_error:
+                raise last_error
+            raise httpx.HTTPStatusError("dxsca marketdata request failed", request=None, response=None)
         except httpx.HTTPStatusError as e:
             if e.response.status_code not in (401, 403):
                 print(f"ERROR: dxsca market data HTTP {e.response.status_code}: {e}")
@@ -265,15 +477,16 @@ class LiquidChartsAPI:
     ) -> Dict[str, Any]:
         """Get historical OHLC data for a symbol"""
         try:
-            headers = LiquidChartsAPI._auth_headers(token, auth_type)
-
-            response = await get_client().get(
-                "/price-history",
-                params={"symbol": symbol, "timeframe": timeframe, "limit": limit},
-                headers=headers
+            return await LiquidChartsAPI.post_market_data(
+                request_payload={
+                    "symbols": [symbol],
+                    "timeframe": timeframe,
+                    "limit": limit,
+                    "type": "candles",
+                },
+                token=token,
+                auth_type=auth_type,
             )
-            response.raise_for_status()
-            return response.json()
         except httpx.HTTPError as e:
             print(f"OHLC data error: {e}")
             raise
@@ -327,23 +540,46 @@ class LiquidChartsAPI:
     ) -> Dict[str, Any]:
         """Place an order on a specific account via dxsca-web accounts API."""
         try:
-            headers = {}
-            if token:
-                if auth_type == "basic":
-                    headers.update(LiquidChartsAPI._basic_headers(token))
-                else:
-                    headers["Authorization"] = f"Bearer {token}"
+            if auth_type == "basic" and token:
+                # For basic auth with X-Liquid-Token, use DXAPI prefix
+                headers = {"Authorization": f"DXAPI {token}", "X-Liquid-Token": token}
+            else:
+                # Bearer auth fallback
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
 
-            response = await get_client().post(
+            order_urls = [
+                f"{LIQUID_ORDER_BASE}/dxsca-fxblue/accounts/{account_code}/orders",
                 f"{LIQUID_METRICS_BASE}/dxsca-web/accounts/{account_code}/orders",
-                json=order_payload,
-                headers=headers,
-            )
-            response.raise_for_status()
-            return response.json()
+            ]
+
+            last_error: Optional[httpx.HTTPStatusError] = None
+            for url in order_urls:
+                response = await get_client().post(
+                    url,
+                    json=order_payload,
+                    headers=headers,
+                )
+                try:
+                    response.raise_for_status()
+                    return response.json()
+                except httpx.HTTPStatusError as e:
+                    last_error = e
+                    if e.response.status_code in (400, 409):
+                        raise
+                    continue
+
+            if last_error:
+                raise last_error
+            raise httpx.HTTPStatusError("Order request failed", request=None, response=None)
 
         except httpx.HTTPError as e:
             print(f"Place account order error: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_detail = e.response.json()
+                    print(f"Error response: {error_detail}")
+                except Exception:
+                    print(f"Error response text: {e.response.text}")
             raise
 
     @staticmethod
@@ -359,7 +595,9 @@ class LiquidChartsAPI:
             headers = {"If-Match": if_match}
             if token:
                 if auth_type == "basic":
-                    headers.update(LiquidChartsAPI._basic_headers(token))
+                    # For basic auth with X-Liquid-Token, use DXAPI prefix
+                    headers["Authorization"] = f"DXAPI {token}"
+                    headers["X-Liquid-Token"] = token
                 else:
                     headers["Authorization"] = f"Bearer {token}"
 
@@ -392,7 +630,9 @@ class LiquidChartsAPI:
             headers = {"If-Match": if_match}
             if token:
                 if auth_type == "basic":
-                    headers.update(LiquidChartsAPI._basic_headers(token))
+                    # For basic auth with X-Liquid-Token, use DXAPI prefix
+                    headers["Authorization"] = f"DXAPI {token}"
+                    headers["X-Liquid-Token"] = token
                 else:
                     headers["Authorization"] = f"Bearer {token}"
 
@@ -590,16 +830,13 @@ class LiquidChartsAPI:
                 if accounts:
                     params["accounts"] = accounts
 
-            if auth_type == "basic" and token:
-                response = await LiquidChartsAPI._dxsca_request_with_basic_retry(
-                    "GET",
-                    url,
-                    token=token,
-                    params=params,
-                )
+            # For basic auth with X-Liquid-Token, use DXAPI prefix
+            if token and auth_type == "basic":
+                headers = {"Authorization": f"DXAPI {token}", "X-Liquid-Token": token}
             else:
                 headers = LiquidChartsAPI._auth_headers(token, auth_type)
-                response = await get_client().get(url, params=params, headers=headers)
+            
+            response = await get_client().get(url, params=params, headers=headers)
             response.raise_for_status()
             return response.json()
 
@@ -645,7 +882,6 @@ class LiquidChartsAPI:
     ) -> Dict[str, Any]:
         """List account portfolio for one or multiple accounts."""
         try:
-            headers = LiquidChartsAPI._auth_headers(token, auth_type)
             params: Dict[str, Any] = {}
             if account_code:
                 url = f"{LIQUID_METRICS_BASE}/dxsca-web/accounts/{account_code}/portfolio"
@@ -654,6 +890,12 @@ class LiquidChartsAPI:
                 if accounts:
                     params["accounts"] = accounts
 
+            # For basic auth with X-Liquid-Token, use DXAPI prefix
+            if token and auth_type == "basic":
+                headers = {"Authorization": f"DXAPI {token}", "X-Liquid-Token": token}
+            else:
+                headers = LiquidChartsAPI._auth_headers(token, auth_type)
+            
             response = await get_client().get(url, params=params, headers=headers)
             response.raise_for_status()
             data = response.json()
@@ -677,7 +919,6 @@ class LiquidChartsAPI:
     ) -> Dict[str, Any]:
         """List open positions for one or multiple accounts."""
         try:
-            headers = LiquidChartsAPI._auth_headers(token, auth_type)
             params: Dict[str, Any] = {}
             if account_code:
                 url = f"{LIQUID_METRICS_BASE}/dxsca-web/accounts/{account_code}/positions"
@@ -686,6 +927,12 @@ class LiquidChartsAPI:
                 if accounts:
                     params["accounts"] = accounts
 
+            # For basic auth with X-Liquid-Token, use DXAPI prefix
+            if token and auth_type == "basic":
+                headers = {"Authorization": f"DXAPI {token}", "X-Liquid-Token": token}
+            else:
+                headers = LiquidChartsAPI._auth_headers(token, auth_type)
+            
             response = await get_client().get(url, params=params, headers=headers)
             response.raise_for_status()
             data = response.json()
@@ -709,7 +956,6 @@ class LiquidChartsAPI:
     ) -> Dict[str, Any]:
         """List open orders for one or multiple accounts."""
         try:
-            headers = LiquidChartsAPI._auth_headers(token, auth_type)
             params: Dict[str, Any] = {}
             if account_code:
                 url = f"{LIQUID_METRICS_BASE}/dxsca-web/accounts/{account_code}/orders"
@@ -718,6 +964,12 @@ class LiquidChartsAPI:
                 if accounts:
                     params["accounts"] = accounts
 
+            # For basic auth with X-Liquid-Token, use DXAPI prefix
+            if token and auth_type == "basic":
+                headers = {"Authorization": f"DXAPI {token}", "X-Liquid-Token": token}
+            else:
+                headers = LiquidChartsAPI._auth_headers(token, auth_type)
+            
             response = await get_client().get(url, params=params, headers=headers)
             response.raise_for_status()
             data = response.json()
@@ -742,7 +994,6 @@ class LiquidChartsAPI:
     ) -> Dict[str, Any]:
         """List cash transfers for one or multiple accounts."""
         try:
-            headers = LiquidChartsAPI._auth_headers(token, auth_type)
             params: Dict[str, Any] = dict(filters or {})
             if account_code:
                 url = f"{LIQUID_METRICS_BASE}/dxsca-web/accounts/{account_code}/transfers"
@@ -751,6 +1002,12 @@ class LiquidChartsAPI:
                 if accounts:
                     params["accounts"] = accounts
 
+            # For basic auth with X-Liquid-Token, use DXAPI prefix
+            if token and auth_type == "basic":
+                headers = {"Authorization": f"DXAPI {token}", "X-Liquid-Token": token}
+            else:
+                headers = LiquidChartsAPI._auth_headers(token, auth_type)
+            
             response = await get_client().get(url, params=params, headers=headers)
             response.raise_for_status()
             data = response.json()
@@ -776,7 +1033,6 @@ class LiquidChartsAPI:
     ) -> Dict[str, Any]:
         """List historical orders (GET/POST) for one or multiple accounts."""
         try:
-            headers = LiquidChartsAPI._auth_headers(token, auth_type)
             query_params: Dict[str, Any] = {}
             body = dict(filters or {})
 
@@ -786,6 +1042,12 @@ class LiquidChartsAPI:
                 url = f"{LIQUID_METRICS_BASE}/dxsca-web/accounts/orders/history"
                 if accounts:
                     query_params["accounts"] = accounts
+
+            # For basic auth with X-Liquid-Token, use DXAPI prefix
+            if token and auth_type == "basic":
+                headers = {"Authorization": f"DXAPI {token}", "X-Liquid-Token": token}
+            else:
+                headers = LiquidChartsAPI._auth_headers(token, auth_type)
 
             if use_post:
                 response = await get_client().post(url, params=query_params, json=body, headers=headers)
@@ -809,7 +1071,6 @@ class LiquidChartsAPI:
     ) -> Dict[str, Any]:
         """List account events for one or multiple accounts."""
         try:
-            headers = LiquidChartsAPI._auth_headers(token, auth_type)
             params: Dict[str, Any] = dict(filters or {})
             if account_code:
                 url = f"{LIQUID_METRICS_BASE}/dxsca-web/accounts/{account_code}/events"
@@ -817,6 +1078,12 @@ class LiquidChartsAPI:
                 url = f"{LIQUID_METRICS_BASE}/dxsca-web/accounts/events"
                 if accounts:
                     params["accounts"] = accounts
+
+            # For basic auth with X-Liquid-Token, use DXAPI prefix
+            if token and auth_type == "basic":
+                headers = {"Authorization": f"DXAPI {token}", "X-Liquid-Token": token}
+            else:
+                headers = LiquidChartsAPI._auth_headers(token, auth_type)
 
             response = await get_client().get(url, params=params, headers=headers)
             response.raise_for_status()

@@ -10,7 +10,7 @@ import {
   Legend,
 } from 'chart.js';
 import { useMarketFeed } from '../hooks/MarketFeedProvider';
-import { liquidMarketData } from '../services/liquidChartsClient';
+import { yahooFinanceClient } from '../services/yahooFinanceClient';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend);
 
@@ -52,27 +52,15 @@ export default function LiveChart({ ticker = 'SIM:NQ', timeframe = '1h', height 
     };
 
     const fetchCandles = async () => {
-      const sessionToken = localStorage.getItem('liquid_session_token');
-      if (!sessionToken || !sessionReady || apiAuthUnavailable) {
-        if (mounted) setApiSeries([]);
-        return;
-      }
-
       try {
-        const response = await liquidMarketData.getOHLC(ticker, timeframe, 200);
+        const response = await yahooFinanceClient.getHistory(ticker, timeframe, 200);
         const normalized = normalizeCandles(response);
         if (mounted) {
           setApiAuthUnavailable(false);
           setApiSeries(normalized);
         }
       } catch (error) {
-        const status = error?.response?.status;
-        if (status === 401 || status === 403) {
-          localStorage.removeItem('liquid_session_token');
-          if (mounted) {
-            setApiAuthUnavailable(true);
-          }
-        }
+        console.error('Error fetching Yahoo Finance history:', error);
         if (mounted) {
           setApiSeries([]);
         }

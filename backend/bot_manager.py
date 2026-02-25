@@ -85,12 +85,15 @@ class BotManager:
                 mapping = {
                     'PURCHASE_AMOUNT': 'purchase_amount',
                     'RISK_PERCENT': 'stop_loss_pct',
+                    'TAKE_PROFIT_PERCENT': 'take_profit_pct',
+                    'TAKE_PROFIT_PCT': 'take_profit_pct',
                     'COOLDOWN_MINUTES': 'cooldown_minutes',
                     'CHECK_INTERVAL_SEC': 'check_interval',
                     'MOVEMENT_CHECK_INTERVAL': 'movement_check_interval',
                     'PROFIT_PATIENCE_MIN': 'profit_patience_min',
                     'PROFIT_PATIENCE_MAX': 'profit_patience_max',
                     'PROFIT_DECLINE_THRESHOLD': 'profit_decline_threshold',
+                    'TIMEZONE': 'timezone',
                 }
                 
                 for frontend_key, backend_key in mapping.items():
