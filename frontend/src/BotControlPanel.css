@@ -1,0 +1,260 @@
+/* Bot Control Panel Styles */
+
+.bot-control-panel {
+  background: linear-gradient(135deg, #1e3a5f 0%, #2d4a6f 100%);
+  border-radius: 12px;
+  padding: 24px;
+  margin: 20px 0;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  color: #ffffff;
+}
+
+.bot-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  border-bottom: 2px solid rgba(255, 255, 255, 0.1);
+  padding-bottom: 12px;
+}
+
+.bot-header h3 {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+
+.bot-state-badge {
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.state-green {
+  background: linear-gradient(135deg, #10b981, #059669);
+  box-shadow: 0 0 15px rgba(16, 185, 129, 0.5);
+}
+
+.state-blue {
+  background: linear-gradient(135deg, #3b82f6, #2563eb);
+  box-shadow: 0 0 15px rgba(59, 130, 246, 0.5);
+}
+
+.state-orange {
+  background: linear-gradient(135deg, #f59e0b, #d97706);
+  box-shadow: 0 0 15px rgba(245, 158, 11, 0.5);
+}
+
+.state-purple {
+  background: linear-gradient(135deg, #8b5cf6, #7c3aed);
+  box-shadow: 0 0 15px rgba(139, 92, 246, 0.5);
+}
+
+.state-red {
+  background: linear-gradient(135deg, #ef4444, #dc2626);
+  box-shadow: 0 0 15px rgba(239, 68, 68, 0.5);
+}
+
+.state-gray {
+  background: linear-gradient(135deg, #6b7280, #4b5563);
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+.bot-controls {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.bot-button {
+  flex: 1;
+  padding: 12px 20px;
+  border: none;
+  border-radius: 8px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.bot-button:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.bot-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.start-button {
+  background: linear-gradient(135deg, #10b981, #059669);
+  color: white;
+}
+
+.start-button:hover:not(:disabled) {
+  background: linear-gradient(135deg, #059669, #047857);
+}
+
+.stop-button {
+  background: linear-gradient(135deg, #ef4444, #dc2626);
+  color: white;
+}
+
+.stop-button:hover:not(:disabled) {
+  background: linear-gradient(135deg, #dc2626, #b91c1c);
+}
+
+.refresh-button {
+  background: linear-gradient(135deg, #6b7280, #4b5563);
+  color: white;
+  max-width: 140px;
+}
+
+.refresh-button:hover:not(:disabled) {
+  background: linear-gradient(135deg, #4b5563, #374151);
+}
+
+.bot-error {
+  background: rgba(239, 68, 68, 0.2);
+  border: 1px solid #ef4444;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 16px;
+  color: #fca5a5;
+  font-size: 0.9rem;
+}
+
+.bot-section {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.bot-section h4 {
+  margin: 0 0 12px 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #60a5fa;
+}
+
+.bot-section h5 {
+  margin: 12px 0 8px 0;
+  font-size: 1rem;
+  font-weight: 500;
+  color: #93c5fd;
+}
+
+.position-active {
+  border: 2px solid #10b981;
+  background: rgba(16, 185, 129, 0.1);
+}
+
+.cooldown-active {
+  border: 2px solid #8b5cf6;
+  background: rgba(139, 92, 246, 0.1);
+}
+
+.bot-info-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+}
+
+.info-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 6px;
+}
+
+.info-label {
+  color: #9ca3af;
+  font-size: 0.9rem;
+}
+
+.info-value {
+  color: #ffffff;
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.info-value.profit {
+  color: #10b981;
+}
+
+.info-value.loss {
+  color: #ef4444;
+}
+
+.cooldown-timer {
+  text-align: center;
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: #a78bfa;
+  padding: 12px;
+  background: rgba(139, 92, 246, 0.2);
+  border-radius: 8px;
+  margin-top: 8px;
+}
+
+.profit-analysis {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.strategy-info {
+  background: rgba(59, 130, 246, 0.1);
+  border: 1px solid rgba(59, 130, 246, 0.3);
+}
+
+.strategy-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.strategy-list li {
+  padding: 6px 0;
+  font-size: 0.9rem;
+  color: #d1d5db;
+  line-height: 1.5;
+}
+
+.info-text {
+  text-align: center;
+  color: #9ca3af;
+  font-size: 0.95rem;
+  margin: 16px 0;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .bot-info-grid {
+    grid-template-columns: 1fr;
+  }
+  
+  .bot-controls {
+    flex-direction: column;
+  }
+  
+  .refresh-button {
+    max-width: 100%;
+  }
+}
