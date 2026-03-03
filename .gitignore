@@ -1,3 +1,17 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variable files
+.env
+.env.local
+.env.*.local
+
+# Node modules
+node_modules/
+package-lock.json
