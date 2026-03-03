@@ -1,13 +1,28 @@
 import React, { useState } from 'react';
-import { liquidAuth } from '../services/liquidChartsClient';
+import { getLiquidApiBase, liquidAuth, setLiquidApiBase } from '../services/liquidChartsClient';
 
 const LIQUID_DOMAIN_STORAGE_KEY = 'liquid_api_domain_v1';
-const DEFAULT_LIQUID_DOMAIN = 'default';
+const DEFAULT_LIQUID_DOMAIN = '';
+
+function isLikelyAndroidPhoneRuntime() {
+  if (typeof window === 'undefined' || typeof navigator === 'undefined') return false;
+  const isCapacitor = !!window.Capacitor;
+  if (!isCapacitor) return false;
+  const ua = String(navigator.userAgent || '').toLowerCase();
+  const looksLikeEmulator = ua.includes('emulator') || ua.includes('sdk_gphone') || ua.includes('google_sdk') || ua.includes('android sdk built for x86');
+  return !looksLikeEmulator;
+}
+
+function isDeviceUnsafeApiBase(url) {
+  const value = String(url || '');
+  return /:\/\/(10\.0\.2\.2|localhost|127\.0\.0\.1)(?::|\/|$)/i.test(value);
+}
 
 function loadSavedDomain() {
   try {
     const saved = localStorage.getItem(LIQUID_DOMAIN_STORAGE_KEY);
-    return (saved && saved.trim()) || DEFAULT_LIQUID_DOMAIN;
+    const normalized = (saved && saved.trim()) || DEFAULT_LIQUID_DOMAIN;
+    return normalized.toLowerCase() === 'default' ? DEFAULT_LIQUID_DOMAIN : normalized;
   } catch {
     return DEFAULT_LIQUID_DOMAIN;
   }
@@ -16,14 +31,16 @@ function loadSavedDomain() {
 export default function LoginScreen({ onLoginSuccess }) {
   const [email, setEmail] = useState('');
   const [domain, setDomain] = useState(() => loadSavedDomain());
+  const [apiBaseUrl, setApiBaseUrl] = useState(() => getLiquidApiBase());
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
   const handleDomainChange = (value) => {
-    setDomain(value);
+    const normalized = (value || '').trim();
+    setDomain(normalized.toLowerCase() === 'default' ? DEFAULT_LIQUID_DOMAIN : normalized);
     try {
-      localStorage.setItem(LIQUID_DOMAIN_STORAGE_KEY, value || DEFAULT_LIQUID_DOMAIN);
+      localStorage.setItem(LIQUID_DOMAIN_STORAGE_KEY, normalized);
     } catch {
       // Ignore localStorage errors in restricted environments
     }
@@ -50,10 +67,37 @@ export default function LoginScreen({ onLoginSuccess }) {
       handleDomainChange(DEFAULT_LIQUID_DOMAIN);
     }
 
+    if (!apiBaseUrl?.trim()) {
+      setError('Backend API URL is required');
+      setLoading(false);
+      return;
+    }
+
+    if (isLikelyAndroidPhoneRuntime() && isDeviceUnsafeApiBase(apiBaseUrl.trim())) {
+      setError('Use your PC LAN IP in Backend API URL on a real Android device (example: http://192.168.1.100:8001/api/trading).');
+      setLoading(false);
+      return;
+    }
+
+    setLiquidApiBase(apiBaseUrl.trim());
+
     try {
-      await liquidAuth.basicLogin(email, domain || DEFAULT_LIQUID_DOMAIN, password);
+      await liquidAuth.basicLogin(email.trim(), domain || DEFAULT_LIQUID_DOMAIN, password);
     } catch (err) {
-      setError('Liquid API login failed. Check username/domain/password.');
+      const responseStatus = err?.response?.status;
+      if (!responseStatus) {
+        const currentBase = getLiquidApiBase();
+        const isEmulatorAlias = String(currentBase).includes('10.0.2.2');
+        const extraHint = isEmulatorAlias
+          ? 'On a real Android device, use your PC LAN IP (example: http://192.168.1.100:8001/api/trading). 10.0.2.2 works only in emulator.'
+          : 'Ensure phone and backend PC are on the same Wi-Fi network, and use PC LAN IP in Backend API URL.';
+        const devHint = import.meta.env.DEV
+          ? ' Backend start command: python -m uvicorn main:app --host 0.0.0.0 --port 8001 --reload.'
+          : '';
+        setError(`Cannot connect to server at ${currentBase}. ${extraHint}${devHint}`.trim());
+      } else {
+        setError('Liquid API login failed. Check email/password.');
+      }
       setLoading(false);
       return;
     }
@@ -103,6 +147,17 @@ export default function LoginScreen({ onLoginSuccess }) {
                   placeholder="you@example.com"
                   className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition"
                 />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">Backend API URL</label>
+                <input
+                  type="text"
+                  value={apiBaseUrl}
+                  onChange={(e) => setApiBaseUrl(e.target.value)}
+                  placeholder="http://10.100.102.10:8001/api/trading"
+                  className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition"
+                />
+                <p className="mt-1 text-[11px] text-gray-500">Android phone: use PC LAN IP (for example, http://192.168.1.100:8001/api/trading). Emulator can use http://10.0.2.2:8001/api/trading.</p>
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">Password</label>

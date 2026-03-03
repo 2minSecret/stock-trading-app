@@ -17,8 +17,9 @@ router = APIRouter()
 class BotStartRequest(BaseModel):
     """Request model for starting a bot"""
     accountId: str = Field(..., description="Trading account ID")
-    username: str = Field(..., description="Auth username")
-    password: str = Field(..., description="Auth password")
+    username: Optional[str] = Field(None, description="Auth username")
+    password: Optional[str] = Field(None, description="Auth password")
+    sessionToken: Optional[str] = Field(None, description="Existing Liquid session token (preferred when available)")
     customConfig: Optional[Dict[str, Any]] = Field(None, description="Optional custom bot configuration")
 
 
@@ -46,11 +47,20 @@ async def start_bot(request: BotStartRequest):
     """
     try:
         logger.info(f"📥 Start bot request for account: {request.accountId}")
+
+        has_credentials = bool(request.username and request.password)
+        has_session_token = bool(request.sessionToken)
+        if not has_credentials and not has_session_token:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either sessionToken or username/password to start bot",
+            )
         
         result = await bot_manager.start_bot(
             account_id=request.accountId,
             username=request.username,
             password=request.password,
+            session_token=request.sessionToken,
             api_base_url="http://localhost:8001",
             custom_config=request.customConfig
         )
@@ -63,6 +73,9 @@ async def start_bot(request: BotStartRequest):
             }
         else:
             raise HTTPException(status_code=400, detail=result['message'])
+
+    except HTTPException:
+        raise
             
     except Exception as e:
         logger.error(f"❌ Error in start_bot endpoint: {e}", exc_info=True)
@@ -95,6 +108,30 @@ async def stop_bot(request: BotStopRequest):
             
     except Exception as e:
         logger.error(f"❌ Error in stop_bot endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/bot/force-stop")
+async def force_stop_bot(request: BotStopRequest):
+    """Force stop automated trading bot for an account."""
+    try:
+        logger.warning(f"📥 Force-stop bot request for account: {request.accountId}")
+
+        result = await bot_manager.force_stop_bot(account_id=request.accountId)
+
+        if result['success']:
+            return {
+                "success": True,
+                "message": result['message'],
+                "data": {}
+            }
+
+        raise HTTPException(status_code=404, detail=result['message'])
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error in force_stop_bot endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

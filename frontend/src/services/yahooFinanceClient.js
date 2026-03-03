@@ -2,7 +2,9 @@
  * Yahoo Finance API client for historical market data
  */
 
-const API_BASE = 'http://localhost:8001/api/trading';
+import { getLiquidApiBase } from './liquidChartsClient';
+
+const API_BASE = getLiquidApiBase();
 
 /**
  * Map common timeframe formats to Yahoo Finance periods and intervals

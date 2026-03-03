@@ -14,6 +14,48 @@ import './BotControlPanel.css';
 
 const frontendHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || `http://${frontendHost}:8001`;
+const BOT_CUSTOM_CONFIG_STORAGE_KEY = 'bot_custom_config_v1';
+
+const normalizeActiveDays = (days) => {
+  if (!Array.isArray(days)) return [1, 2, 3, 4, 5, 6, 7];
+
+  const hasZeroBasedValue = days.some((value) => Number(value) === 0);
+  const normalized = days
+    .map((value) => Number(value))
+    .filter((value) => Number.isInteger(value))
+    .map((value) => (hasZeroBasedValue ? value + 1 : value))
+    .filter((value) => value >= 1 && value <= 7);
+
+  return normalized.length > 0 ? Array.from(new Set(normalized)).sort((a, b) => a - b) : [1, 2, 3, 4, 5, 6, 7];
+};
+
+const getStoredBotConfig = () => {
+  const fallback = {
+    TRADING_WINDOW: { START: '00:00', END: '23:59' },
+    ACTIVE_DAYS: [1, 2, 3, 4, 5, 6, 7],
+  };
+
+  try {
+    const raw = localStorage.getItem(BOT_CUSTOM_CONFIG_STORAGE_KEY);
+    if (!raw) return fallback;
+
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return fallback;
+
+    const start = parsed?.TRADING_WINDOW?.START;
+    const end = parsed?.TRADING_WINDOW?.END;
+    const hasWindow = typeof start === 'string' && start && typeof end === 'string' && end;
+
+    return {
+      ...fallback,
+      ...parsed,
+      TRADING_WINDOW: hasWindow ? { START: start, END: end } : fallback.TRADING_WINDOW,
+      ACTIVE_DAYS: normalizeActiveDays(parsed.ACTIVE_DAYS),
+    };
+  } catch (_error) {
+    return fallback;
+  }
+};
 
 export default function BotControlPanel({ selectedAccount, authCredentials }) {
   const [botStatus, setBotStatus] = useState(null);
@@ -65,8 +107,10 @@ export default function BotControlPanel({ selectedAccount, authCredentials }) {
 
   // Start bot
   const handleStartBot = async () => {
-    if (!selectedAccount?.accountId || !authCredentials?.username || !authCredentials?.password) {
-      setError('Missing account or credentials');
+    const sessionToken = localStorage.getItem('liquid_session_token') || undefined;
+    const hasCredentials = !!(authCredentials?.username && authCredentials?.password);
+    if (!selectedAccount?.accountId || (!hasCredentials && !sessionToken)) {
+      setError('Missing account or authentication (session or credentials)');
       return;
     }
 
@@ -77,7 +121,9 @@ export default function BotControlPanel({ selectedAccount, authCredentials }) {
       const response = await axios.post(`${API_BASE_URL}/api/trading/bot/start`, {
         accountId: selectedAccount.accountId,
         username: authCredentials.username,
-        password: authCredentials.password
+        password: authCredentials.password,
+        sessionToken,
+        customConfig: getStoredBotConfig(),
       });
 
       if (response.data.success) {
@@ -132,6 +178,7 @@ export default function BotControlPanel({ selectedAccount, authCredentials }) {
     const stateColors = {
       'idle': 'gray',
       'waiting_for_window': 'orange',
+      'waiting_for_day': 'orange',
       'monitoring_entry': 'blue',
       'in_position': 'green',
       'cooldown': 'purple',
@@ -141,6 +188,7 @@ export default function BotControlPanel({ selectedAccount, authCredentials }) {
     const stateLabels = {
       'idle': 'Idle',
       'waiting_for_window': '⏰ Waiting for Window',
+      'waiting_for_day': '📅 Waiting for Active Day',
       'monitoring_entry': '👀 Monitoring Entry',
       'in_position': '📈 In Position',
       'cooldown': '💤 Cooldown',

@@ -7,9 +7,12 @@ import asyncio
 import logging
 from datetime import datetime, time, timedelta
 from enum import Enum
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 import httpx
+import time as pytime
+import uuid
+import math
 from zoneinfo import ZoneInfo
 
 from profit_analyzer import ProfitAnalyzer
@@ -20,6 +23,7 @@ logger = logging.getLogger(__name__)
 class BotState(str, Enum):
     IDLE = "idle"
     WAITING_FOR_WINDOW = "waiting_for_window"
+    WAITING_FOR_DAY = "waiting_for_day"
     MONITORING_ENTRY = "monitoring_entry"
     IN_POSITION = "in_position"
     COOLDOWN = "cooldown"
@@ -42,6 +46,18 @@ class TradingConfig:
     profit_decline_threshold: float = 0.02  # 2%
     movement_check_interval: int = 10  # seconds
     timezone: Optional[str] = None  # IANA timezone (e.g., "America/New_York")
+    active_days: List[int] = None  # ISO weekday numbers (1=Mon ... 7=Sun)
+    entry_timeframe: str = "5m"
+    entry_candles_limit: int = 120
+    entry_fast_ma: int = 9
+    entry_slow_ma: int = 21
+    entry_min_trend_pct: float = 0.0001  # 0.01%
+    entry_min_momentum_pct: float = 0.00005  # 0.005%
+    entry_required_signals: int = 3
+
+    def __post_init__(self):
+        if self.active_days is None:
+            self.active_days = [1, 2, 3, 4, 5]
 
 
 class TradingBot:
@@ -107,12 +123,17 @@ class TradingBot:
         )
 
         # Auth/session for market data endpoints
-        self.session_token: Optional[str] = None
+        self.session_token: Optional[str] = self._extract_token_from_payload(self.auth)
         
         # Cooldown tracking
         self.cooldown_until: Optional[datetime] = None
         self.last_movement_check_at: Optional[datetime] = None
         self.last_movement_signal: Optional[Dict[str, Any]] = None
+        self.last_entry_signal: Optional[Dict[str, Any]] = None
+        self.blocked_by: Optional[str] = None
+        self.blocked_details: Optional[Dict[str, Any]] = None
+        self.cached_quote: Optional[Dict[str, Any]] = None
+        self.cached_candles: Optional[List[Dict[str, float]]] = None
         
         # Statistics
         self.stats = {
@@ -143,20 +164,64 @@ class TradingBot:
     def _now(self) -> datetime:
         """Return current timezone-aware datetime for bot scheduling decisions."""
         return datetime.now(self.runtime_tz)
+
+    def _set_blocked(self, reason: Optional[str], details: Optional[Dict[str, Any]] = None):
+        """Track why the bot is currently blocked from progressing to order execution."""
+        self.blocked_by = reason
+        self.blocked_details = details
+
+    def _is_within_trading_window(self, current_time: time) -> bool:
+        """Return True when current_time is inside configured trading window.
+
+        Supports both same-day windows (start <= end) and overnight windows
+        that cross midnight (start > end, e.g. 22:00-02:00).
+        """
+        start = self.config.trade_window_start
+        end = self.config.trade_window_end
+
+        if start <= end:
+            return start <= current_time <= end
+
+        return current_time >= start or current_time <= end
         
     async def start(self):
         """Start the trading bot"""
         if self.is_running:
             logger.warning("⚠️ Bot already running")
             return False
+
+        try:
+            await self._ensure_session_token()
+            quote_probe = await self._get_market_price()
+            if not quote_probe:
+                self._set_blocked("startup_market_quote_unavailable")
+                self.last_entry_signal = {
+                    "buy": False,
+                    "reason": "Startup preflight failed: market quote unavailable (session unauthorized or marketdata blocked)",
+                }
+                logger.error("❌ Bot start preflight failed: cannot access market quote")
+                return False
+        except Exception as e:
+            self._set_blocked("startup_exception", {"error": str(e)})
+            self.last_entry_signal = {
+                "buy": False,
+                "reason": f"Startup preflight failed: {e}",
+            }
+            logger.error(f"❌ Bot start preflight exception: {e}")
+            return False
         
         logger.info(f"🚀 Starting NAS100 Trading Bot")
         logger.info(f"   Symbol: {self.config.symbol}")
         logger.info(f"   Window: {self.config.trade_window_start} - {self.config.trade_window_end}")
         logger.info(f"   Timezone: {self.runtime_tz_name}")
+        logger.info(f"   Active Days: {self.config.active_days}")
         logger.info(f"   Stop Loss: {self.config.stop_loss_pct*100}%")
         logger.info(f"   Take Profit: {self.config.take_profit_pct*100}%")
         logger.info(f"   Profit Strategy: {self.config.profit_patience_min}-{self.config.profit_patience_max}s patience, {self.config.profit_decline_threshold*100}% decline threshold")
+        logger.info(
+            f"   Entry Signal: tf={self.config.entry_timeframe}, candles={self.config.entry_candles_limit}, "
+            f"MA({self.config.entry_fast_ma}/{self.config.entry_slow_ma}), required={self.config.entry_required_signals}"
+        )
         
         self.is_running = True
         self.stats['started_at'] = self._now().isoformat()
@@ -191,17 +256,34 @@ class TradingBot:
             while self.is_running:
                 now = self._now()
                 current_time = now.time().replace(tzinfo=None)
+
+                # Check active weekday constraint (1=Mon .. 7=Sun)
+                weekday = now.isoweekday()
+                if self.config.active_days and weekday not in self.config.active_days:
+                    self._set_blocked("inactive_day", {
+                        "weekday": weekday,
+                        "active_days": self.config.active_days,
+                    })
+                    self.state = BotState.WAITING_FOR_DAY
+                    logger.debug(f"📅 Inactive day {weekday}; bot waiting for active days {self.config.active_days}")
+                    await asyncio.sleep(self.config.check_interval)
+                    continue
                 
                 # Check if in cooldown
                 if self.cooldown_until and now < self.cooldown_until:
                     self.state = BotState.COOLDOWN
                     remaining = (self.cooldown_until - now).total_seconds()
+                    self._set_blocked("cooldown", {"remaining_seconds": int(max(0, remaining))})
                     logger.debug(f"💤 Cooldown: {remaining:.0f}s remaining")
                     await asyncio.sleep(self.config.check_interval)
                     continue
                 
                 # Check trading window
-                if not (self.config.trade_window_start <= current_time <= self.config.trade_window_end):
+                if not self._is_within_trading_window(current_time):
+                    self._set_blocked("outside_trading_window", {
+                        "current_time": current_time.strftime('%H:%M:%S'),
+                        "window": f"{self.config.trade_window_start} - {self.config.trade_window_end}",
+                    })
                     self.state = BotState.WAITING_FOR_WINDOW
                     logger.debug(f"⏰ Outside trading window (current: {current_time.strftime('%H:%M:%S')})")
                     await asyncio.sleep(self.config.check_interval)
@@ -211,10 +293,12 @@ class TradingBot:
                 if self.current_position is None:
                     # No position - look for entry
                     self.state = BotState.MONITORING_ENTRY
+                    self._set_blocked("evaluating_entry")
                     await self._try_enter_position()
                 else:
                     # Have position - monitor for exit
                     self.state = BotState.IN_POSITION
+                    self._set_blocked(None)
                     await self._monitor_position()
                 
                 await asyncio.sleep(self.config.check_interval)
@@ -235,12 +319,51 @@ class TradingBot:
             # Get current market price
             price_data = await self._get_market_price()
             if not price_data:
+                self._set_blocked("market_quote_unavailable")
+                self.last_entry_signal = {
+                    "buy": False,
+                    "reason": "Market quote unavailable (auth/session/marketdata issue)",
+                }
                 logger.warning("⚠️ Could not fetch market price")
                 return
             
             current_price = price_data.get('bid', 0)
             if current_price <= 0:
+                self._set_blocked("invalid_market_price", {"price": current_price})
+                self.last_entry_signal = {
+                    "buy": False,
+                    "reason": f"Invalid market price received: {current_price}",
+                }
                 logger.warning("⚠️ Invalid market price")
+                return
+
+            candles = await self._get_market_candles(
+                timeframe=self.config.entry_timeframe,
+                limit=self.config.entry_candles_limit,
+            )
+            if not candles or len(candles) < max(self.config.entry_slow_ma, 20):
+                self._set_blocked("insufficient_candles", {
+                    "samples": len(candles) if candles else 0,
+                    "required": max(self.config.entry_slow_ma, 20),
+                })
+                self.last_entry_signal = {
+                    "buy": False,
+                    "reason": "Not enough candle history for entry evaluation",
+                    "samples": len(candles) if candles else 0,
+                }
+                logger.info("⏳ Waiting for enough chart history to evaluate entry")
+                return
+
+            entry_signal = self._analyze_entry_signal(candles=candles, current_price=float(current_price))
+            self.last_entry_signal = entry_signal
+
+            if not entry_signal.get("buy"):
+                self._set_blocked("entry_signal_rejected", {
+                    "score": entry_signal.get("score"),
+                    "required": entry_signal.get("required"),
+                    "reason": entry_signal.get("reason"),
+                })
+                logger.info(f"✋ HOLD entry: {entry_signal.get('reason')}")
                 return
             
             # Place buy order
@@ -253,6 +376,7 @@ class TradingBot:
             )
             
             if order_result and order_result.get('success'):
+                self._set_blocked(None)
                 self.current_position = order_result
                 self.entry_price = current_price
                 self.position_id = order_result.get('orderId') or order_result.get('id')
@@ -279,9 +403,15 @@ class TradingBot:
                     f"SL={self.stop_loss_price:.2f} TP={self.take_profit_price:.2f}"
                 )
             else:
+                self._set_blocked("order_placement_failed", {"result": order_result})
+                self.last_entry_signal = {
+                    "buy": False,
+                    "reason": f"Order placement failed: {order_result}",
+                }
                 logger.error(f"❌ Failed to enter position: {order_result}")
         
         except Exception as e:
+            self._set_blocked("entry_exception", {"error": str(e)})
             logger.error(f"❌ Error entering position: {e}", exc_info=True)
     
     async def _monitor_position(self):
@@ -502,27 +632,168 @@ class TradingBot:
                     return str(nested_order_code)
 
         return None
+
+    def _map_symbol_for_yahoo(self, symbol: str) -> str:
+        mapped = {
+            "NAS100": "^IXIC",
+            "NASDAQ": "^IXIC",
+            "SPX": "^GSPC",
+            "SP500": "^GSPC",
+            "DOW": "^DJI",
+            "DJI": "^DJI",
+        }
+        return mapped.get(str(symbol or "").upper(), symbol)
+
+    def _timeframe_to_yahoo(self, timeframe: str, limit: int = 100) -> Dict[str, str]:
+        tf = str(timeframe or "1h").lower()
+
+        if tf in ("1m", "2m", "5m"):
+            return {"period": "1d", "interval": tf}
+        if tf in ("15m", "30m"):
+            return {"period": "5d", "interval": tf}
+        if tf in ("1h", "60m"):
+            return {"period": "1mo", "interval": "1h"}
+
+        if tf == "1d":
+            if limit <= 30:
+                return {"period": "1mo", "interval": "1d"}
+            if limit <= 90:
+                return {"period": "3mo", "interval": "1d"}
+            if limit <= 180:
+                return {"period": "6mo", "interval": "1d"}
+            return {"period": "1y", "interval": "1d"}
+
+        return {"period": "1mo", "interval": "1d"}
+
+    def _to_float(self, value: Any) -> Optional[float]:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(parsed):
+            return None
+        return parsed
+
+    def _extract_quote_from_payload(self, payload: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return None
+
+        candidates: List[Dict[str, Any]] = []
+        direct_quotes = payload.get("quotes")
+        if isinstance(direct_quotes, list):
+            candidates.extend([row for row in direct_quotes if isinstance(row, dict)])
+
+        nested = payload.get("data")
+        if isinstance(nested, dict):
+            nested_quotes = nested.get("quotes")
+            if isinstance(nested_quotes, list):
+                candidates.extend([row for row in nested_quotes if isinstance(row, dict)])
+
+            nested_quote = nested.get("quote")
+            if isinstance(nested_quote, dict):
+                candidates.append(nested_quote)
+
+        direct_quote = payload.get("quote")
+        if isinstance(direct_quote, dict):
+            candidates.append(direct_quote)
+
+        for quote in candidates:
+            price = (
+                self._to_float(quote.get("last"))
+                or self._to_float(quote.get("price"))
+                or self._to_float(quote.get("bid"))
+                or self._to_float(quote.get("ask"))
+                or self._to_float(quote.get("close"))
+            )
+            if price is None or price <= 0:
+                continue
+
+            high = (
+                self._to_float(quote.get("high"))
+                or self._to_float(quote.get("dayHigh"))
+                or self._to_float(quote.get("highPrice"))
+                or price
+            )
+            low = (
+                self._to_float(quote.get("low"))
+                or self._to_float(quote.get("dayLow"))
+                or self._to_float(quote.get("lowPrice"))
+                or price
+            )
+
+            return {
+                'bid': float(price),
+                'ask': float(price),
+                'last': float(price),
+                'high': float(high),
+                'low': float(low),
+                'raw': quote,
+            }
+
+        return None
+
+    async def _fetch_yahoo_quote(self) -> Optional[Dict[str, Any]]:
+        yahoo_symbol = self._map_symbol_for_yahoo(self.config.symbol)
+        yahoo_response = await self.client.get(
+            f"{self.api_base_url}/api/trading/yahoo/history",
+            params={"symbol": yahoo_symbol, "period": "1d", "interval": "1m"},
+        )
+        yahoo_response.raise_for_status()
+        yahoo_data = yahoo_response.json()
+        candles = yahoo_data.get("candles") if isinstance(yahoo_data, dict) else None
+        if not isinstance(candles, list) or not candles:
+            return None
+
+        last = candles[-1] or {}
+        price = self._to_float(last.get("close"))
+        if price is None or price <= 0:
+            return None
+
+        high = self._to_float(last.get("high")) or price
+        low = self._to_float(last.get("low")) or price
+        return {
+            'bid': float(price),
+            'ask': float(price),
+            'last': float(price),
+            'high': float(high),
+            'low': float(low),
+            'raw': {"source": "yahoo", "symbol": yahoo_symbol, **last},
+        }
+
+    async def _fetch_yahoo_candles(self, timeframe: str, limit: int) -> Optional[List[Dict[str, float]]]:
+        yahoo_symbol = self._map_symbol_for_yahoo(self.config.symbol)
+        yahoo_params = self._timeframe_to_yahoo(timeframe, int(limit))
+        yahoo_response = await self.client.get(
+            f"{self.api_base_url}/api/trading/yahoo/history",
+            params={
+                "symbol": yahoo_symbol,
+                "period": yahoo_params["period"],
+                "interval": yahoo_params["interval"],
+            },
+        )
+        yahoo_response.raise_for_status()
+        yahoo_payload = yahoo_response.json()
+        parsed = self._extract_candles(yahoo_payload)
+        if not parsed:
+            return None
+        return parsed[-int(limit):] if int(limit) > 0 else parsed
     
     async def _get_market_price(self) -> Optional[Dict[str, Any]]:
         """Fetch current market price from API"""
         try:
-            await self._ensure_session_token()
+            errors: List[str] = []
 
-            # Call backend API endpoint
-            response = await self.client.post(
-                f"{self.api_base_url}/api/trading/marketdata",
-                json={
-                    "request": {
-                        "symbols": [self.config.symbol],
-                        "market": "spot",
-                        "type": "quote",
-                    }
-                },
-                headers={"X-Liquid-Token": self.session_token},
-            )
+            # Yahoo is currently the most reliable quote source for NAS100.
+            try:
+                yahoo_quote = await self._fetch_yahoo_quote()
+                if yahoo_quote:
+                    self.cached_quote = yahoo_quote
+                    return yahoo_quote
+            except Exception as exc:
+                errors.append(f"yahoo={exc}")
 
-            if response.status_code in (401, 403):
-                self.session_token = None
+            # Keep marketdata as a secondary source.
+            try:
                 await self._ensure_session_token()
                 response = await self.client.post(
                     f"{self.api_base_url}/api/trading/marketdata",
@@ -536,43 +807,35 @@ class TradingBot:
                     headers={"X-Liquid-Token": self.session_token},
                 )
 
-            response.raise_for_status()
-            data = response.json()
-            
-            if isinstance(data, dict) and data.get('success'):
-                payload = data.get('data', {})
-                quotes = payload.get('quotes') if isinstance(payload, dict) else None
-                if isinstance(quotes, list) and quotes:
-                    quote = quotes[0] or {}
-                    price = quote.get('last') or quote.get('price') or quote.get('bid') or quote.get('ask')
-                    if isinstance(price, (int, float)):
-                        high = quote.get('high') or quote.get('dayHigh') or quote.get('highPrice') or price
-                        low = quote.get('low') or quote.get('dayLow') or quote.get('lowPrice') or price
-                        return {
-                            'bid': float(price),
-                            'ask': float(price),
-                            'last': float(price),
-                            'high': float(high) if isinstance(high, (int, float)) else float(price),
-                            'low': float(low) if isinstance(low, (int, float)) else float(price),
-                            'raw': quote,
-                        }
+                if response.status_code in (401, 403):
+                    self._invalidate_session_token()
+                    await self._ensure_session_token_internal(force_refresh=True)
+                    response = await self.client.post(
+                        f"{self.api_base_url}/api/trading/marketdata",
+                        json={
+                            "request": {
+                                "symbols": [self.config.symbol],
+                                "market": "spot",
+                                "type": "quote",
+                            }
+                        },
+                        headers={"X-Liquid-Token": self.session_token},
+                    )
 
-            if isinstance(data, dict):
-                quotes = data.get('quotes')
-                if isinstance(quotes, list) and quotes:
-                    quote = quotes[0] or {}
-                    price = quote.get('last') or quote.get('price') or quote.get('bid') or quote.get('ask')
-                    if isinstance(price, (int, float)):
-                        high = quote.get('high') or quote.get('dayHigh') or quote.get('highPrice') or price
-                        low = quote.get('low') or quote.get('dayLow') or quote.get('lowPrice') or price
-                        return {
-                            'bid': float(price),
-                            'ask': float(price),
-                            'last': float(price),
-                            'high': float(high) if isinstance(high, (int, float)) else float(price),
-                            'low': float(low) if isinstance(low, (int, float)) else float(price),
-                            'raw': quote,
-                        }
+                response.raise_for_status()
+                parsed_quote = self._extract_quote_from_payload(response.json())
+                if parsed_quote:
+                    self.cached_quote = parsed_quote
+                    return parsed_quote
+            except Exception as exc:
+                errors.append(f"marketdata={exc}")
+
+            if errors:
+                logger.warning(f"⚠️ Live quote sources unavailable: {' | '.join(errors)}")
+
+            if self.cached_quote:
+                logger.warning("⚠️ Using cached quote because live quote sources are unavailable")
+                return self.cached_quote
             
             return None
             
@@ -580,38 +843,281 @@ class TradingBot:
             logger.error(f"❌ Error fetching market price: {e}")
             return None
 
+    async def _get_market_candles(self, timeframe: str, limit: int) -> Optional[List[Dict[str, float]]]:
+        """Fetch candle history for entry signal generation."""
+        try:
+            errors: List[str] = []
+
+            # Prefer Yahoo candles for reliability when dxsca marketdata is unavailable.
+            try:
+                yahoo_candles = await self._fetch_yahoo_candles(timeframe=timeframe, limit=int(limit))
+                if yahoo_candles and len(yahoo_candles) >= 10:
+                    self.cached_candles = yahoo_candles
+                    return yahoo_candles
+            except Exception as exc:
+                errors.append(f"yahoo={exc}")
+
+            await self._ensure_session_token()
+
+            attempted_timeframes = [timeframe]
+            for fallback_tf in ["1m", "5m", "15m", "1h"]:
+                if fallback_tf not in attempted_timeframes:
+                    attempted_timeframes.append(fallback_tf)
+
+            for tf in attempted_timeframes:
+                try:
+                    response = await self.client.post(
+                        f"{self.api_base_url}/api/trading/marketdata",
+                        json={
+                            "request": {
+                                "symbols": [self.config.symbol],
+                                "market": "spot",
+                                "type": "candles",
+                                "timeframe": tf,
+                                "limit": int(limit),
+                            }
+                        },
+                        headers={"X-Liquid-Token": self.session_token},
+                    )
+
+                    if response.status_code in (401, 403):
+                        self._invalidate_session_token()
+                        await self._ensure_session_token_internal(force_refresh=True)
+                        response = await self.client.post(
+                            f"{self.api_base_url}/api/trading/marketdata",
+                            json={
+                                "request": {
+                                    "symbols": [self.config.symbol],
+                                    "market": "spot",
+                                    "type": "candles",
+                                    "timeframe": tf,
+                                    "limit": int(limit),
+                                }
+                            },
+                            headers={"X-Liquid-Token": self.session_token},
+                        )
+
+                    response.raise_for_status()
+                    parsed = self._extract_candles(response.json())
+                    if parsed and len(parsed) >= 10:
+                        self.cached_candles = parsed
+                        return parsed
+                except Exception as exc:
+                    errors.append(f"marketdata[{tf}]={exc}")
+                    continue
+
+            if errors:
+                logger.warning(f"⚠️ Live candle sources unavailable: {' | '.join(errors)}")
+
+            if self.cached_candles:
+                logger.warning("⚠️ Using cached candles because live candle sources are unavailable")
+                return self.cached_candles[-int(limit):] if int(limit) > 0 else self.cached_candles
+
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error fetching market candles: {e}")
+            return None
+
+    def _extract_candles(self, payload: Dict[str, Any]) -> List[Dict[str, float]]:
+        """Normalize candle payload shapes into a sorted OHLC list."""
+        candidates = []
+
+        if isinstance(payload, dict):
+            candidates.append(payload.get("candles"))
+            candidates.append(payload.get("bars"))
+            candidates.append(payload.get("ohlc"))
+            data = payload.get("data")
+            if isinstance(data, dict):
+                candidates.append(data.get("candles"))
+                candidates.append(data.get("bars"))
+                candidates.append(data.get("ohlc"))
+                candidates.append(data.get("series"))
+                candidates.append(data.get("history"))
+
+        parsed: List[Dict[str, float]] = []
+        source = None
+        for candidate in candidates:
+            if isinstance(candidate, list) and candidate:
+                source = candidate
+                break
+
+        if not isinstance(source, list):
+            return parsed
+
+        for item in source:
+            candle = None
+            if isinstance(item, dict):
+                close = item.get("close") or item.get("c")
+                open_price = item.get("open") or item.get("o")
+                high = item.get("high") or item.get("h")
+                low = item.get("low") or item.get("l")
+                ts = item.get("ts") or item.get("t") or item.get("timestamp")
+                if all(v is not None for v in [open_price, high, low, close]):
+                    candle = {
+                        "ts": float(ts) if ts is not None else 0.0,
+                        "open": float(open_price),
+                        "high": float(high),
+                        "low": float(low),
+                        "close": float(close),
+                    }
+            elif isinstance(item, (list, tuple)) and len(item) >= 5:
+                # [ts, open, high, low, close, ...]
+                candle = {
+                    "ts": float(item[0]) if item[0] is not None else 0.0,
+                    "open": float(item[1]),
+                    "high": float(item[2]),
+                    "low": float(item[3]),
+                    "close": float(item[4]),
+                }
+
+            if candle:
+                parsed.append(candle)
+
+        parsed.sort(key=lambda x: x.get("ts", 0.0))
+        return parsed
+
+    def _analyze_entry_signal(self, candles: List[Dict[str, float]], current_price: float) -> Dict[str, Any]:
+        """
+        Build BUY signal from trend + momentum using historical candles.
+
+        BUY is allowed when at least `entry_required_signals` conditions are true:
+        1) Fast MA > Slow MA
+        2) Last close above fast MA
+        3) Short return positive enough
+        4) Recent slope positive enough
+        """
+        closes = [float(c.get("close", 0.0)) for c in candles if float(c.get("close", 0.0)) > 0]
+        if len(closes) < max(self.config.entry_slow_ma, 10):
+            return {
+                "buy": False,
+                "reason": "Insufficient close samples",
+                "samples": len(closes),
+            }
+
+        fast_n = max(2, int(self.config.entry_fast_ma))
+        slow_n = max(fast_n + 1, int(self.config.entry_slow_ma))
+        fast_ma = sum(closes[-fast_n:]) / fast_n
+        slow_ma = sum(closes[-slow_n:]) / slow_n
+        last_close = closes[-1]
+
+        momentum_window = min(8, len(closes) - 1)
+        base_close = closes[-1 - momentum_window]
+        short_return_pct = ((last_close - base_close) / base_close) if base_close > 0 else 0.0
+
+        slope_window = min(slow_n, len(closes))
+        slice_closes = closes[-slope_window:]
+        x_vals = list(range(len(slice_closes)))
+        x_mean = sum(x_vals) / len(x_vals)
+        y_mean = sum(slice_closes) / len(slice_closes)
+        denominator = sum((x - x_mean) ** 2 for x in x_vals) or 1.0
+        slope_abs = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_vals, slice_closes)) / denominator
+        slope_pct = (slope_abs / y_mean) if y_mean > 0 else 0.0
+
+        cond_ma_trend = fast_ma > slow_ma
+        cond_price_above_fast = current_price >= fast_ma and last_close >= fast_ma
+        cond_short_return = short_return_pct >= float(self.config.entry_min_trend_pct)
+        cond_slope = slope_pct >= float(self.config.entry_min_momentum_pct)
+
+        condition_flags = {
+            "ma_trend_up": cond_ma_trend,
+            "price_above_fast_ma": cond_price_above_fast,
+            "short_return_positive": cond_short_return,
+            "slope_positive": cond_slope,
+        }
+        score = sum(1 for value in condition_flags.values() if value)
+        required = max(1, int(self.config.entry_required_signals))
+        buy = score >= required
+
+        reason = (
+            f"signals {score}/{len(condition_flags)} | "
+            f"fast={fast_ma:.2f} slow={slow_ma:.2f} ret={short_return_pct*100:.3f}% slope={slope_pct*100:.3f}%"
+        )
+
+        return {
+            "buy": buy,
+            "reason": reason,
+            "score": score,
+            "required": required,
+            "signals": condition_flags,
+            "metrics": {
+                "current_price": current_price,
+                "last_close": last_close,
+                "fast_ma": fast_ma,
+                "slow_ma": slow_ma,
+                "short_return_pct": short_return_pct,
+                "slope_pct": slope_pct,
+            },
+            "samples": len(closes),
+        }
+
     async def _ensure_session_token(self):
         """Ensure bot has a valid basic-auth session token for market data endpoints."""
-        if self.session_token:
+        await self._ensure_session_token_internal(force_refresh=False)
+
+    async def _ensure_session_token_internal(self, force_refresh: bool):
+        if self.session_token and not force_refresh:
             return
+
+        existing = self._extract_token_from_payload(self.auth)
+        if existing and not force_refresh:
+            self.session_token = existing
+            return
+
+        if force_refresh:
+            self.auth.pop('session_token', None)
+            self.auth.pop('sessionToken', None)
+            self.auth.pop('token', None)
+            self.auth.pop('accessToken', None)
+
+        username = self.auth.get('username')
+        password = self.auth.get('password')
+        if not username or not password:
+            raise ValueError("Missing credentials for token refresh: provide username/password or a valid session token")
 
         response = await self.client.post(
             f"{self.api_base_url}/api/trading/auth/basic/login",
             json={
-                "username": self.auth.get('username'),
+                "username": username,
                 "domain": self.auth.get('domain', ''),
-                "password": self.auth.get('password'),
+                "password": password,
             },
         )
         response.raise_for_status()
         data = response.json()
 
-        token = (
-            data.get('token')
-            or data.get('sessionToken')
-            or data.get('sessionID')
-            or data.get('sessionId')
-            or data.get('id')
-            or (data.get('data') or {}).get('token')
-            or (data.get('data') or {}).get('sessionToken')
-            or (data.get('data') or {}).get('sessionID')
-            or (data.get('data') or {}).get('sessionId')
-            or (data.get('data') or {}).get('id')
-        )
+        token = self._extract_token_from_payload(data)
         if not token:
             raise ValueError("No session token received from basic login")
 
         self.session_token = token
+        self.auth['session_token'] = token
+        self.auth['token'] = token
+
+    def _extract_token_from_payload(self, payload: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+
+        token = (
+            payload.get('session_token')
+            or payload.get('sessionToken')
+            or payload.get('token')
+            or payload.get('accessToken')
+            or (payload.get('data') or {}).get('session_token')
+            or (payload.get('data') or {}).get('sessionToken')
+            or (payload.get('data') or {}).get('token')
+            or (payload.get('data') or {}).get('accessToken')
+        )
+        if not token:
+            return None
+
+        return str(token)
+
+    def _invalidate_session_token(self):
+        self.session_token = None
+        self.auth.pop('session_token', None)
+        self.auth.pop('sessionToken', None)
+        self.auth.pop('token', None)
+        self.auth.pop('accessToken', None)
     
     async def _place_order(
         self,
@@ -624,30 +1130,61 @@ class TradingBot:
         order_type: str = "MARKET",
         price: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Place an order via bot API endpoint"""
+        """Place an order via account order endpoint (same flow as home screen)."""
         try:
-            payload = {
-                "accountId": self.account_id,
-                "symbol": symbol,
-                "side": side,
-                "quantity": quantity,
-                "amount": amount,
-                "username": self.auth.get('username'),
-                "password": self.auth.get('password'),
-                "positionEffect": position_effect,
-                "orderType": order_type,
+            await self._ensure_session_token()
+
+            normalized_side = str(side or "BUY").upper()
+            normalized_type = str(order_type or "MARKET").upper()
+            normalized_effect = str(position_effect or "OPEN").upper()
+
+            order_payload = {
+                "orderCode": f"web-{int(pytime.time() * 1000)}-{uuid.uuid4().hex[:6]}",
+                "type": normalized_type,
+                "positionEffect": normalized_effect,
+                "tif": "GTC",
+                "instrument": symbol,
+                "side": normalized_side,
+                "quantity": float(quantity),
             }
             if position_code:
-                payload["positionCode"] = position_code
+                order_payload["positionCode"] = str(position_code)
             if price is not None:
-                payload["price"] = price
+                order_payload["price"] = float(price)
 
             response = await self.client.post(
-                f"{self.api_base_url}/api/trading/bot/orders/place",
-                json=payload
+                f"{self.api_base_url}/api/trading/orders/account/place",
+                headers={"X-Liquid-Token": self.session_token},
+                json={
+                    "account_code": self.account_id,
+                    "order": order_payload,
+                },
             )
+            if response.status_code in (401, 403):
+                self._invalidate_session_token()
+                await self._ensure_session_token_internal(force_refresh=True)
+                response = await self.client.post(
+                    f"{self.api_base_url}/api/trading/orders/account/place",
+                    headers={"X-Liquid-Token": self.session_token},
+                    json={
+                        "account_code": self.account_id,
+                        "order": order_payload,
+                    },
+                )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+
+            order_id = (
+                (result or {}).get("id")
+                or (result or {}).get("orderId")
+                or (result or {}).get("orderCode")
+                or (result or {}).get("clientOrderId")
+            )
+            return {
+                "success": True,
+                "orderId": order_id,
+                "data": result,
+            }
             
         except Exception as e:
             logger.error(f"❌ Error placing order: {e}")
@@ -665,8 +1202,16 @@ class TradingBot:
                 'stop_loss_pct': self.config.stop_loss_pct * 100,
                 'take_profit_pct': self.config.take_profit_pct * 100,
                 'trade_window': f"{self.config.trade_window_start} - {self.config.trade_window_end}",
+                'active_days': self.config.active_days,
                 'cooldown_minutes': self.config.cooldown_minutes,
                 'movement_check_interval': self.config.movement_check_interval,
+                'entry_timeframe': self.config.entry_timeframe,
+                'entry_candles_limit': self.config.entry_candles_limit,
+                'entry_fast_ma': self.config.entry_fast_ma,
+                'entry_slow_ma': self.config.entry_slow_ma,
+                'entry_min_trend_pct': self.config.entry_min_trend_pct,
+                'entry_min_momentum_pct': self.config.entry_min_momentum_pct,
+                'entry_required_signals': self.config.entry_required_signals,
                 'timezone': self.runtime_tz_name,
             },
             'current_position': None,
@@ -674,6 +1219,9 @@ class TradingBot:
             'statistics': self.stats,
             'profit_analysis': None,
             'movement_signal': self.last_movement_signal,
+            'entry_signal': self.last_entry_signal,
+            'blocked_by': self.blocked_by,
+            'blocked_details': self.blocked_details,
             'last_trigger': {
                 'type': self.last_trigger_type,
                 'at': self.last_trigger_at,

@@ -36,6 +36,12 @@ export default function ChartsViewScreen({
   isLiveBlocked = false,
   onPlaceBracketOrder,
   onPlaceTouchCloseOrder,
+  onModifyOrder,
+  onCancelOrder,
+  isOrderActionSubmitting = false,
+  isOrderActionDisabled = false,
+  orderHistoryRows = [],
+  accountEventRows = [],
 }) {
   const { prices, history } = useMarketFeed();
   const chartRef = useRef(null);
@@ -69,11 +75,15 @@ export default function ChartsViewScreen({
   const [autoTouchTriggerEnabled, setAutoTouchTriggerEnabled] = useState(true);
   const [isTouchTriggerSubmitting, setIsTouchTriggerSubmitting] = useState(false);
   const [xViewRange, setXViewRange] = useState({ min: null, max: null });
+  const [isFollowingLatest, setIsFollowingLatest] = useState(true);
   const lastTouchTriggerKeyRef = useRef('');
+  const autoReturnTimerRef = useRef(null);
 
   const ZOOM_WHEEL_SPEED = 0.08;
   const ZOOM_DRAG_THRESHOLD = 6;
   const PAN_THRESHOLD = 2;
+  const AUTO_RETURN_DELAY_MS = 5000;
+  const CHART_RIGHT_PADDING_BARS = 40;
   const fullscreenPanelWidth = 'min(clamp(220px, 35vw, 360px), calc(100vw - 96px))';
 
   // Helper to get display name for ticker
@@ -206,6 +216,28 @@ export default function ChartsViewScreen({
       : date.toLocaleDateString([], { month: 'short', day: 'numeric' });
   };
 
+  const pickValue = (source, keys) => {
+    if (!source || typeof source !== 'object') return null;
+    for (const key of keys) {
+      const value = source[key];
+      if (value !== undefined && value !== null && value !== '') return value;
+    }
+    return null;
+  };
+
+  const normalizeSide = (raw) => {
+    const value = String(raw || '').toUpperCase();
+    if (value === 'BUY' || value === 'SELL') return value;
+    return null;
+  };
+
+  const normalizeTime = (raw) => {
+    if (!raw) return { sortTime: 0, label: '—' };
+    const date = new Date(raw);
+    if (Number.isNaN(date.getTime())) return { sortTime: 0, label: String(raw) };
+    return { sortTime: date.getTime(), label: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) };
+  };
+
   // Calculate price change
   const derivedPrice = apiQuote?.price ?? apiQuote?.last ?? tickerData.price;
   const prev = filteredHistory.length > 1
@@ -227,6 +259,24 @@ export default function ChartsViewScreen({
       return { ts: point.ts, open, high, low, close };
     });
   }, [filteredHistory]);
+
+  const paddedCandleSeries = useMemo(() => {
+    if (candleSeries.length === 0) return [];
+    const lastPoint = candleSeries[candleSeries.length - 1];
+    const prevPoint = candleSeries.length > 1 ? candleSeries[candleSeries.length - 2] : null;
+    const stepMsRaw = prevPoint ? (lastPoint.ts - prevPoint.ts) : 60_000;
+    const stepMs = Number.isFinite(stepMsRaw) && stepMsRaw > 0 ? stepMsRaw : 60_000;
+    const padding = Array.from({ length: CHART_RIGHT_PADDING_BARS }, (_, index) => ({
+      ts: lastPoint.ts + stepMs * (index + 1),
+      price: lastPoint.close,
+      open: lastPoint.close,
+      high: lastPoint.close,
+      low: lastPoint.close,
+      close: lastPoint.close,
+      isPadding: true,
+    }));
+    return [...candleSeries, ...padding];
+  }, [candleSeries]);
 
   // Calculate high/low
   const prices_arr = candleSeries.map(p => p.close).filter((value) => Number.isFinite(value));
@@ -258,6 +308,14 @@ export default function ChartsViewScreen({
   const periodLabel = periodMinutes >= 60
     ? `${Math.floor(periodMinutes / 60)}h ${periodMinutes % 60}m`
     : `${periodMinutes}m`;
+  const placeBracketDisabledReason = isSubmittingBracket
+    ? 'Submitting order...'
+    : !sessionReady
+      ? 'Session is not ready yet.'
+      : !showTradeLines
+        ? 'Use Buy or Sell to arm TP/SL lines.'
+        : '';
+  const isPlaceBracketDisabled = Boolean(placeBracketDisabledReason);
 
   const initializeTradeLines = (nextSide) => {
     if (!Number.isFinite(currentEntryPrice) || currentEntryPrice <= 0) return;
@@ -283,11 +341,19 @@ export default function ChartsViewScreen({
     initializeTradeLines(nextSide);
   };
 
-  const hideTradeLines = () => {
-    setShowTradeLines(false);
-    setActivePositionCode('');
-    setIsTouchTriggerSubmitting(false);
-    lastTouchTriggerKeyRef.current = '';
+  const toggleTradeLines = () => {
+    if (showTradeLines) {
+      setShowTradeLines(false);
+      setActivePositionCode('');
+      setIsTouchTriggerSubmitting(false);
+      lastTouchTriggerKeyRef.current = '';
+      return;
+    }
+
+    setShowTradeLines(true);
+    if (!Number.isFinite(stopLossPrice) || !Number.isFinite(takeProfitPrice)) {
+      initializeTradeLines(tradeSide);
+    }
   };
 
   const extractPositionCode = (payload) => {
@@ -530,13 +596,15 @@ export default function ChartsViewScreen({
 
   // Chart data
   const chartData = useMemo(() => {
-    const labels = candleSeries.map(p => formatTimestampByTimeframe(p.ts));
-    const wickData = candleSeries.map((point, index) => ({ x: labels[index], y: [point.low, point.high] }));
-    const bodyData = candleSeries.map((point, index) => ({ x: labels[index], y: [point.open, point.close] }));
-    const candleColors = candleSeries.map((point) => {
+    const labels = paddedCandleSeries.map(p => formatTimestampByTimeframe(p.ts));
+    const wickData = paddedCandleSeries.map((point, index) => ({ x: labels[index], y: [point.low, point.high] }));
+    const bodyData = paddedCandleSeries.map((point, index) => ({ x: labels[index], y: [point.open, point.close] }));
+    const candleColors = paddedCandleSeries.map((point) => {
+      if (point.isPadding) return 'rgba(0,0,0,0)';
       return point.close >= point.open ? '#3b82f6' : '#ef4444';
     });
-    const candleFills = candleSeries.map((point) => {
+    const candleFills = paddedCandleSeries.map((point) => {
+      if (point.isPadding) return 'rgba(0,0,0,0)';
       return point.close >= point.open ? 'rgba(59, 130, 246, 0.75)' : 'rgba(239, 68, 68, 0.75)';
     });
     
@@ -569,7 +637,56 @@ export default function ChartsViewScreen({
         },
       ]
     };
-  }, [candleSeries, selectedTicker, timeframe]);
+  }, [paddedCandleSeries, selectedTicker, timeframe]);
+
+  const followWindowSize = Math.max(30, Math.round(candleSeries.length * 0.35));
+  const followLatestRange = useMemo(() => {
+    if (candleSeries.length === 0) return { min: null, max: null };
+    const latestIndex = candleSeries.length - 1;
+    const halfWindow = Math.max(10, Math.floor(followWindowSize / 2));
+    const min = latestIndex - halfWindow;
+    const max = latestIndex + halfWindow;
+    return { min, max };
+  }, [candleSeries.length, followWindowSize]);
+
+  const isNearFollowRange = (min, max) => {
+    if (!Number.isFinite(min) || !Number.isFinite(max)) return false;
+    if (!Number.isFinite(followLatestRange.min) || !Number.isFinite(followLatestRange.max)) return false;
+    return Math.abs(min - followLatestRange.min) <= 1 && Math.abs(max - followLatestRange.max) <= 1;
+  };
+
+  const clearAutoReturnTimer = () => {
+    if (!autoReturnTimerRef.current) return;
+    clearTimeout(autoReturnTimerRef.current);
+    autoReturnTimerRef.current = null;
+  };
+
+  const scheduleAutoReturnToLatest = () => {
+    clearAutoReturnTimer();
+    autoReturnTimerRef.current = setTimeout(() => {
+      setIsFollowingLatest(true);
+      if (Number.isFinite(followLatestRange.min) && Number.isFinite(followLatestRange.max)) {
+        setXViewRange({ min: followLatestRange.min, max: followLatestRange.max });
+      }
+    }, AUTO_RETURN_DELAY_MS);
+  };
+
+  useEffect(() => {
+    if (!isFollowingLatest) return;
+    clearAutoReturnTimer();
+    if (!Number.isFinite(followLatestRange.min) || !Number.isFinite(followLatestRange.max)) return;
+    setXViewRange({ min: followLatestRange.min, max: followLatestRange.max });
+  }, [isFollowingLatest, followLatestRange.min, followLatestRange.max]);
+
+  useEffect(() => {
+    return () => {
+      clearAutoReturnTimer();
+    };
+  }, []);
+
+  useEffect(() => {
+    setIsFollowingLatest(true);
+  }, [selectedTicker, timeframe]);
 
   const chartOptions = useMemo(() => ({
     responsive: true,
@@ -639,14 +756,28 @@ export default function ChartsViewScreen({
           const scaleX = chart?.scales?.x;
           if (!scaleX) return;
           if (Number.isFinite(scaleX.min) && Number.isFinite(scaleX.max)) {
+            if (isNearFollowRange(scaleX.min, scaleX.max)) {
+              setIsFollowingLatest(true);
+              setXViewRange({ min: followLatestRange.min, max: followLatestRange.max });
+              return;
+            }
+            setIsFollowingLatest(false);
             setXViewRange({ min: scaleX.min, max: scaleX.max });
+            scheduleAutoReturnToLatest();
           }
         },
         onPanComplete: ({ chart }) => {
           const scaleX = chart?.scales?.x;
           if (!scaleX) return;
           if (Number.isFinite(scaleX.min) && Number.isFinite(scaleX.max)) {
+            if (isNearFollowRange(scaleX.min, scaleX.max)) {
+              setIsFollowingLatest(true);
+              setXViewRange({ min: followLatestRange.min, max: followLatestRange.max });
+              return;
+            }
+            setIsFollowingLatest(false);
             setXViewRange({ min: scaleX.min, max: scaleX.max });
+            scheduleAutoReturnToLatest();
           }
         },
       }
@@ -687,7 +818,78 @@ export default function ChartsViewScreen({
         }
       }
     }
-  }), [isPanning, candleSeries, low, high, ZOOM_WHEEL_SPEED, ZOOM_DRAG_THRESHOLD, PAN_THRESHOLD, xViewRange.min, xViewRange.max]);
+  }), [
+    isPanning,
+    candleSeries,
+    low,
+    high,
+    ZOOM_WHEEL_SPEED,
+    ZOOM_DRAG_THRESHOLD,
+    PAN_THRESHOLD,
+    xViewRange.min,
+    xViewRange.max,
+    followLatestRange.min,
+    followLatestRange.max,
+    AUTO_RETURN_DELAY_MS,
+  ]);
+
+  const liveTradeActions = useMemo(() => {
+    const historyActions = (Array.isArray(orderHistoryRows) ? orderHistoryRows : [])
+      .map((row, idx) => {
+        const side = normalizeSide(pickValue(row, ['side', 'orderSide', 'action']));
+        if (!side) return null;
+
+        const instrument = String(pickValue(row, ['instrument', 'symbol', 'ticker']) || '').toUpperCase();
+        const tickerMatch = !instrument || instrument === String(selectedTicker || '').toUpperCase();
+        if (!tickerMatch) return null;
+
+        const status = pickValue(row, ['status', 'state', 'orderStatus']) || 'Updated';
+        const quantity = pickValue(row, ['quantity', 'qty', 'size']);
+        const timeRaw = pickValue(row, ['issuedAt', 'issued', 'timestamp', 'time', 'createdAt']);
+        const { sortTime, label } = normalizeTime(timeRaw);
+
+        return {
+          id: `history-${idx}-${sortTime}`,
+          side,
+          status: String(status),
+          quantity: quantity !== null ? String(quantity) : '',
+          timeLabel: label,
+          sortTime,
+        };
+      })
+      .filter(Boolean);
+
+    const eventActions = (Array.isArray(accountEventRows) ? accountEventRows : [])
+      .map((row, idx) => {
+        const type = String(pickValue(row, ['type', 'eventType', 'reason']) || '').toUpperCase();
+        const message = String(pickValue(row, ['message', 'description', 'details', 'text']) || '');
+        const side = message.toUpperCase().includes('SELL') ? 'SELL' : message.toUpperCase().includes('BUY') ? 'BUY' : null;
+        if (!side) return null;
+
+        const looksLikeTrade = type.includes('ORDER') || type.includes('FILL') || type.includes('EXEC');
+        if (!looksLikeTrade && !message.toUpperCase().includes('ORDER')) return null;
+
+        const includesTicker = message.toUpperCase().includes(String(selectedTicker || '').toUpperCase());
+        if (!includesTicker && selectedTicker) return null;
+
+        const timeRaw = pickValue(row, ['time', 'timestamp', 'eventTime', 'createdAt']);
+        const { sortTime, label } = normalizeTime(timeRaw);
+
+        return {
+          id: `event-${idx}-${sortTime}`,
+          side,
+          status: String(type || 'Event'),
+          quantity: '',
+          timeLabel: label,
+          sortTime,
+        };
+      })
+      .filter(Boolean);
+
+    return [...historyActions, ...eventActions]
+      .sort((a, b) => (b.sortTime || 0) - (a.sortTime || 0))
+      .slice(0, 5);
+  }, [orderHistoryRows, accountEventRows, selectedTicker]);
 
   // Chart control functions
   const handleZoomIn = () => {
@@ -706,15 +908,21 @@ export default function ChartsViewScreen({
     if (chartRef.current) {
       chartRef.current.resetZoom();
     }
-    setXViewRange({ min: null, max: null });
+    setIsFollowingLatest(true);
+    clearAutoReturnTimer();
+    if (Number.isFinite(followLatestRange.min) && Number.isFinite(followLatestRange.max)) {
+      setXViewRange({ min: followLatestRange.min, max: followLatestRange.max });
+    } else {
+      setXViewRange({ min: null, max: null });
+    }
   };
 
   // Keep timeline marker at latest candle when data updates
   useEffect(() => {
-    if (filteredHistory.length > 0) {
+    if (isFollowingLatest && filteredHistory.length > 0) {
       setSelectedTimeIndex(filteredHistory.length - 1);
     }
-  }, [filteredHistory.length]);
+  }, [filteredHistory.length, isFollowingLatest]);
 
   // Handle timeline scrubber drag
   const handleTimelineDragStart = (e) => {
@@ -731,7 +939,9 @@ export default function ChartsViewScreen({
     const percentage = Math.max(0, Math.min(1, x / timelineRect.width));
     const newIndex = Math.floor(percentage * (filteredHistory.length - 1));
 
+    setIsFollowingLatest(false);
     setSelectedTimeIndex(newIndex);
+    scheduleAutoReturnToLatest();
 
     // Pan chart to match timeline position
     if (chartRef.current) {
@@ -774,6 +984,10 @@ export default function ChartsViewScreen({
   const handleToggleFullscreen = async () => {
     const next = !isFullscreen;
     setIsFullscreen(next);
+    if (Number.isFinite(followLatestRange.min) && Number.isFinite(followLatestRange.max)) {
+      setIsFollowingLatest(true);
+      setXViewRange({ min: followLatestRange.min, max: followLatestRange.max });
+    }
     if (next) {
       setIsFullscreenPanelVisible(true);
     }
@@ -883,10 +1097,10 @@ export default function ChartsViewScreen({
         </button>
         <button
           type="button"
-          onClick={hideTradeLines}
-          className="h-8 px-3 rounded bg-gray-700/70 hover:bg-gray-600 text-white text-xs font-semibold"
+          onClick={toggleTradeLines}
+          className={`h-8 px-3 rounded text-white text-xs font-semibold ${showTradeLines ? 'bg-cyan-700/80 hover:bg-cyan-600' : 'bg-gray-700/70 hover:bg-gray-600'}`}
         >
-          Hide Lines
+          Lines: {showTradeLines ? 'ON' : 'OFF'}
         </button>
       </div>
 
@@ -933,12 +1147,36 @@ export default function ChartsViewScreen({
         <button
           type="button"
           onClick={handlePlaceBracket}
-          disabled={isSubmittingBracket || !sessionReady || !showTradeLines}
-          className="h-8 w-full rounded bg-cyan-600/80 hover:bg-cyan-500 text-white text-xs font-semibold disabled:opacity-50"
+          disabled={isPlaceBracketDisabled}
+          title={placeBracketDisabledReason || 'Place bracket order'}
+          className="h-8 w-full rounded bg-cyan-600/80 hover:bg-cyan-500 text-white text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {isSubmittingBracket ? 'Submitting...' : 'Place Bracket'}
         </button>
       </div>
+
+      <div className={`mt-2 grid gap-2 ${isFullscreen ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2'}`}>
+        <button
+          type="button"
+          onClick={onModifyOrder}
+          disabled={isOrderActionSubmitting || isOrderActionDisabled || typeof onModifyOrder !== 'function'}
+          className="h-8 w-full rounded bg-gray-700/70 hover:bg-gray-600 text-white text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {isOrderActionSubmitting ? 'Submitting...' : 'Modify Order'}
+        </button>
+        <button
+          type="button"
+          onClick={onCancelOrder}
+          disabled={isOrderActionSubmitting || isOrderActionDisabled || typeof onCancelOrder !== 'function'}
+          className="h-8 w-full rounded bg-red-700/70 hover:bg-red-600 text-white text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {isOrderActionSubmitting ? 'Submitting...' : 'Cancel Order'}
+        </button>
+      </div>
+
+      {!!placeBracketDisabledReason && !isSubmittingBracket && (
+        <p className="mt-2 text-xs text-amber-300">{placeBracketDisabledReason}</p>
+      )}
 
       <div className="mt-3 flex items-center gap-2">
         <input
@@ -954,7 +1192,7 @@ export default function ChartsViewScreen({
       </div>
 
       {!showTradeLines && (
-        <p className="mt-2 text-xs text-gray-400">Click Buy or Sell to show draggable TP/SL lines on chart.</p>
+        <p className="mt-2 text-xs text-gray-400">Use Buy or Sell to show draggable TP/SL lines on chart.</p>
       )}
 
       {showTradeLines && !activePositionCode && (
@@ -972,6 +1210,28 @@ export default function ChartsViewScreen({
       {selectedTradeAccount && (
         <p className="mt-2 text-[10px] text-gray-500">Account: {selectedTradeAccount.label} ({selectedTradeAccount.code})</p>
       )}
+
+      <div className="mt-3 border-t border-gray-700/30 pt-2">
+        <p className="text-[10px] text-gray-500 uppercase tracking-wider">Live Trade Status</p>
+        {liveTradeActions.length === 0 ? (
+          <p className="mt-1 text-xs text-gray-500">Waiting for BUY/SELL actions on {selectedTicker}...</p>
+        ) : (
+          <div className="mt-2 space-y-1.5">
+            {liveTradeActions.map((action) => (
+              <div key={action.id} className="flex items-center justify-between gap-2 rounded bg-gray-900/60 border border-gray-700/30 px-2 py-1.5">
+                <div className="min-w-0">
+                  <p className={`text-xs font-semibold ${action.side === 'BUY' ? 'text-cyan-400' : 'text-rose-400'}`}>
+                    {action.side} {action.quantity ? `${action.quantity}` : ''}
+                  </p>
+                  <p className="text-[10px] text-gray-400 truncate">{action.status}</p>
+                </div>
+                <span className="text-[10px] text-gray-500">{action.timeLabel}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       {!!bracketStatus && <p className="mt-2 text-xs text-emerald-400">{bracketStatus}</p>}
       {!!bracketError && <p className="mt-2 text-xs text-rose-400">{bracketError}</p>}
     </div>

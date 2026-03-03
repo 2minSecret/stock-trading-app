@@ -6,7 +6,89 @@ import axios from 'axios';
  */
 
 const frontendHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
-const LIQUID_API_BASE = import.meta.env.VITE_LIQUID_API_URL || `http://${frontendHost}:8001/api/trading`;
+const isCapacitorRuntime = typeof window !== 'undefined' && !!window.Capacitor;
+const API_BASE_STORAGE_KEY = 'liquid_api_base_url_v1';
+const EMULATOR_DEFAULT_API_BASE = 'http://10.0.2.2:8001/api/trading';
+
+function normalizeApiBaseUrl(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  return raw.replace(/\/+$/, '');
+}
+
+function loadSavedApiBase() {
+  try {
+    return normalizeApiBaseUrl(localStorage.getItem(API_BASE_STORAGE_KEY) || '');
+  } catch {
+    return '';
+  }
+}
+
+function isLikelyAndroidEmulator() {
+  if (typeof navigator === 'undefined') return false;
+  const ua = String(navigator.userAgent || '').toLowerCase();
+  return (
+    ua.includes('emulator')
+    || ua.includes('sdk_gphone')
+    || ua.includes('android sdk built for x86')
+    || ua.includes('google_sdk')
+    || ua.includes('genymotion')
+  );
+}
+
+function isEmulatorOnlyBase(url) {
+  return /:\/\/10\.0\.2\.2(?::|\/|$)/i.test(String(url || ''));
+}
+
+function isLocalhostBase(url) {
+  return /:\/\/(localhost|127\.0\.0\.1)(?::|\/|$)/i.test(String(url || ''));
+}
+
+function resolveApiBase() {
+  const saved = loadSavedApiBase();
+  if (saved) {
+    const isRealDeviceCapacitor = isCapacitorRuntime && !isLikelyAndroidEmulator();
+    const savedIsDeviceUnsafe = isEmulatorOnlyBase(saved) || isLocalhostBase(saved);
+
+    if (!(isRealDeviceCapacitor && savedIsDeviceUnsafe)) {
+      return saved;
+    }
+
+    try {
+      localStorage.removeItem(API_BASE_STORAGE_KEY);
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
+  const envBase = normalizeApiBaseUrl(import.meta.env.VITE_LIQUID_API_URL || '');
+  if (envBase) return envBase;
+
+  if (isCapacitorRuntime) {
+    if (isLikelyAndroidEmulator()) return EMULATOR_DEFAULT_API_BASE;
+    return '';
+  }
+
+  return `http://${frontendHost}:8001/api/trading`;
+}
+
+let currentLiquidApiBase = resolveApiBase();
+
+export const getLiquidApiBase = () => currentLiquidApiBase;
+
+export const setLiquidApiBase = (value) => {
+  const normalized = normalizeApiBaseUrl(value);
+  if (!normalized) return;
+
+  try {
+    localStorage.setItem(API_BASE_STORAGE_KEY, normalized);
+  } catch {
+    // Ignore storage errors
+  }
+
+  currentLiquidApiBase = normalized;
+  liquidClient.defaults.baseURL = normalized;
+};
 
 function normalizeDxscaSymbol(symbol) {
   const map = {
@@ -51,7 +133,7 @@ function applySessionHeader(token) {
 
 // Create axios instance with base config
 const liquidClient = axios.create({
-  baseURL: LIQUID_API_BASE,
+  baseURL: currentLiquidApiBase,
   headers: {
     'Content-Type': 'application/json',
   }

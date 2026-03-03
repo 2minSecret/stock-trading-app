@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: stock-trading-backend
+    env: docker
+    rootDir: backend
+    autoDeploy: true
+    healthCheckPath: /api/trading
+    envVars:
+      - key: FRONTEND_ORIGINS
+        value: http://localhost:5173,http://127.0.0.1:5173,capacitor://localhost,ionic://localhost
+      - key: SIMULATE_FEED
+        value: "true"
+      - key: POLYGON_SYMBOLS
+        value: ^IXIC,AAPL,TSLA,MSFT,GOOGL,AMZN,NVDA,META,NFLX

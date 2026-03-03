@@ -13,13 +13,94 @@ import asyncio
 import time
 import json
 import logging
+import math
+from urllib.parse import unquote
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["trading"])
 
-UNAUTHORIZED_MARKETDATA_COOLDOWN_SECONDS = 10.0
+
+@router.get("")
+@router.get("/")
+async def trading_root():
+    """Lightweight connectivity endpoint for /api/trading base path."""
+    return {
+        "success": True,
+        "message": "Trading API is reachable",
+        "data": {
+            "auth_login": "/api/trading/auth/basic/login",
+            "openapi": "/openapi.json",
+        },
+    }
+
+UNAUTHORIZED_MARKETDATA_COOLDOWN_SECONDS = 0.0
 _marketdata_unauthorized_until: Dict[str, float] = {}
+
+
+@dataclass
+class _YahooHistoryCacheEntry:
+    payload: Dict[str, Any]
+    fetched_at: float
+
+
+_yahoo_history_cache: Dict[str, _YahooHistoryCacheEntry] = {}
+
+
+def _yahoo_cache_key(symbol: str, period: str, interval: str) -> str:
+    return f"{str(symbol).upper()}|{str(period).lower()}|{str(interval).lower()}"
+
+
+def _yahoo_cache_ttl_seconds(interval: str) -> float:
+    normalized = str(interval or "").lower()
+    mapping = {
+        "1m": 15.0,
+        "2m": 20.0,
+        "5m": 30.0,
+        "15m": 45.0,
+        "30m": 60.0,
+        "60m": 120.0,
+        "1h": 120.0,
+        "90m": 180.0,
+        "1d": 900.0,
+    }
+    return mapping.get(normalized, 60.0)
+
+
+def _normalize_yahoo_symbol(symbol: str) -> str:
+    value = str(symbol or "").strip()
+    for _ in range(2):
+        decoded = unquote(value)
+        if decoded == value:
+            break
+        value = decoded.strip()
+    return value.upper()
+
+
+def _normalize_yahoo_interval(interval: str) -> str:
+    value = str(interval or "").strip().lower()
+    aliases = {
+        "1h": "60m",
+    }
+    return aliases.get(value, value)
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        as_float = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(as_float):
+        return None
+    return as_float
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 # ===== Request Models =====
 class PlaceOrderRequest(BaseModel):
@@ -77,8 +158,9 @@ class BotOrderRequest(BaseModel):
     positionCode: Optional[str] = None
     orderCode: Optional[str] = None
     price: Optional[float] = None
-    username: str
-    password: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+    sessionToken: Optional[str] = None
 
 class ModifyAccountOrderRequest(BaseModel):
     account_code: str
@@ -126,11 +208,15 @@ def get_auth_context(authorization: Optional[str], x_liquid_token: Optional[str]
     return token, auth_type
 
 
-def _marketdata_client_key(http_request: Request) -> str:
+def _marketdata_client_key(http_request: Request, token: Optional[str] = None) -> str:
         client_host = http_request.client.host if http_request.client else "unknown"
         forwarded_for = http_request.headers.get("x-forwarded-for")
         if forwarded_for:
-            return forwarded_for.split(",")[0].strip()
+            client_host = forwarded_for.split(",")[0].strip()
+
+        token_hint = (token or "")[:8]
+        if token_hint:
+            return f"{client_host}:{token_hint}"
         return client_host
 
 
@@ -490,13 +576,33 @@ async def get_yahoo_history(
     interval: str = Query("1h", description="Data interval (1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo)"),
 ):
     """Get historical OHLC data from Yahoo Finance"""
+    normalized_symbol = _normalize_yahoo_symbol(symbol)
+    normalized_interval = _normalize_yahoo_interval(interval)
+    normalized_period = str(period or "").strip().lower()
+
+    if not normalized_symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+
+    cache_key = _yahoo_cache_key(normalized_symbol, normalized_period, normalized_interval)
+    now = time.monotonic()
+    ttl = _yahoo_cache_ttl_seconds(normalized_interval)
+    cached_entry = _yahoo_history_cache.get(cache_key)
+    if cached_entry and (now - cached_entry.fetched_at) <= ttl:
+        cached_payload = dict(cached_entry.payload)
+        cached_payload["cache"] = {
+            "status": "hit",
+            "stale": False,
+            "age_seconds": int(max(0, now - cached_entry.fetched_at)),
+        }
+        return cached_payload
+
     try:
         import yfinance as yf
         import asyncio
         
         def fetch_history():
-            ticker = yf.Ticker(symbol)
-            hist = ticker.history(period=period, interval=interval)
+            ticker = yf.Ticker(normalized_symbol)
+            hist = ticker.history(period=normalized_period, interval=normalized_interval)
             
             if hist.empty:
                 return []
@@ -504,13 +610,24 @@ async def get_yahoo_history(
             # Convert to list of candles
             candles = []
             for timestamp, row in hist.iterrows():
+                open_value = _safe_float(row.get('Open'))
+                high_value = _safe_float(row.get('High'))
+                low_value = _safe_float(row.get('Low'))
+                close_value = _safe_float(row.get('Close'))
+                if (
+                    open_value is None
+                    or high_value is None
+                    or low_value is None
+                    or close_value is None
+                ):
+                    continue
                 candles.append({
                     "ts": int(timestamp.timestamp() * 1000),  # Convert to milliseconds
-                    "open": float(row['Open']),
-                    "high": float(row['High']),
-                    "low": float(row['Low']),
-                    "close": float(row['Close']),
-                    "volume": int(row['Volume']) if 'Volume' in row else 0,
+                    "open": open_value,
+                    "high": high_value,
+                    "low": low_value,
+                    "close": close_value,
+                    "volume": _safe_int(row.get('Volume'), default=0),
                 })
             
             return candles
@@ -518,14 +635,100 @@ async def get_yahoo_history(
         # Run yfinance in a thread to avoid blocking
         candles = await asyncio.to_thread(fetch_history)
         
-        return {
+        payload = {
             "success": True,
-            "symbol": symbol,
+            "symbol": normalized_symbol,
             "candles": candles,
-            "count": len(candles)
+            "count": len(candles),
+            "cache": {
+                "status": "miss",
+                "stale": False,
+                "age_seconds": 0,
+            },
         }
+        _yahoo_history_cache[cache_key] = _YahooHistoryCacheEntry(payload=payload, fetched_at=now)
+        return payload
         
     except Exception as e:
+        error_text = str(e)
+        lowered = error_text.lower()
+        if cached_entry and (
+            "too many requests" in lowered
+            or "rate limit" in lowered
+            or "429" in lowered
+        ):
+            stale_payload = dict(cached_entry.payload)
+            stale_payload["cache"] = {
+                "status": "stale-fallback",
+                "stale": True,
+                "age_seconds": int(max(0, now - cached_entry.fetched_at)),
+            }
+            stale_payload["warning"] = "Yahoo Finance rate-limited; serving cached data"
+            logger.warning(
+                "Yahoo Finance rate-limited for %s; returning cached history (age=%ss)",
+                cache_key,
+                int(max(0, now - cached_entry.fetched_at)),
+            )
+            return stale_payload
+
+        if (
+            "too many requests" in lowered
+            or "rate limit" in lowered
+            or "429" in lowered
+        ):
+            try:
+                import yfinance as yf
+                import asyncio
+
+                degraded_interval = "1d" if normalized_interval == "60m" else "60m"
+
+                def fetch_degraded_history():
+                    ticker = yf.Ticker(normalized_symbol)
+                    hist = ticker.history(period=normalized_period, interval=degraded_interval)
+                    if hist.empty:
+                        return []
+                    candles = []
+                    for timestamp, row in hist.iterrows():
+                        open_value = _safe_float(row.get('Open'))
+                        high_value = _safe_float(row.get('High'))
+                        low_value = _safe_float(row.get('Low'))
+                        close_value = _safe_float(row.get('Close'))
+                        if (
+                            open_value is None
+                            or high_value is None
+                            or low_value is None
+                            or close_value is None
+                        ):
+                            continue
+                        candles.append({
+                            "ts": int(timestamp.timestamp() * 1000),
+                            "open": open_value,
+                            "high": high_value,
+                            "low": low_value,
+                            "close": close_value,
+                            "volume": _safe_int(row.get('Volume'), default=0),
+                        })
+                    return candles
+
+                degraded_candles = await asyncio.to_thread(fetch_degraded_history)
+                if degraded_candles:
+                    degraded_payload = {
+                        "success": True,
+                        "symbol": normalized_symbol,
+                        "candles": degraded_candles,
+                        "count": len(degraded_candles),
+                        "cache": {
+                            "status": "degraded-interval",
+                            "stale": False,
+                            "age_seconds": 0,
+                        },
+                        "warning": f"Yahoo rate-limited for interval '{interval}', returned '{degraded_interval}' data",
+                    }
+                    _yahoo_history_cache[cache_key] = _YahooHistoryCacheEntry(payload=degraded_payload, fetched_at=now)
+                    return degraded_payload
+            except Exception as degraded_exc:
+                logger.warning(f"Yahoo degraded interval fallback failed: {degraded_exc}")
+
         logger.error(f"Yahoo Finance history error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch Yahoo Finance data: {str(e)}")
 
@@ -545,10 +748,10 @@ async def post_dxsca_market_data(
         print(f"DEBUG: authorization header: {authorization}")
         print(f"DEBUG: x_liquid_token header: {x_liquid_token}")
         print(f"DEBUG: all headers: {dict(http_request.headers)}")
-        client_key = _marketdata_client_key(http_request)
+        client_key = _marketdata_client_key(http_request, x_liquid_token)
         now = time.monotonic()
         blocked_until = _marketdata_unauthorized_until.get(client_key)
-        if blocked_until and now < blocked_until:
+        if UNAUTHORIZED_MARKETDATA_COOLDOWN_SECONDS > 0 and blocked_until and now < blocked_until:
             retry_after = max(1, int(blocked_until - now))
             raise HTTPException(
                 status_code=401,
@@ -596,7 +799,7 @@ async def post_dxsca_market_data(
             _marketdata_unauthorized_until.pop(client_key, None)
         return data
     except httpx.HTTPStatusError as e:
-        if client_key and e.response.status_code in (401, 403):
+        if client_key and UNAUTHORIZED_MARKETDATA_COOLDOWN_SECONDS > 0 and e.response.status_code in (401, 403):
             _marketdata_unauthorized_until[client_key] = time.monotonic() + UNAUTHORIZED_MARKETDATA_COOLDOWN_SECONDS
         response_body = None
         try:
@@ -998,22 +1201,41 @@ async def place_account_bracket_order(
 async def place_bot_order(request: BotOrderRequest):
     """
     Place a buy/sell order from the trading bot.
-    Accepts bot-format request with username/password authentication.
+    Accepts bot-format request with either:
+    - existing session token (preferred)
+    - username/password authentication fallback.
     """
     try:
-        # Authenticate with username/password
-        login_data = await LiquidChartsAPI.basic_login(
-            username=request.username,
-            domain="",
-            password=request.password
-        )
-        
-        if not login_data.get('success'):
-            raise HTTPException(status_code=401, detail="Authentication failed")
-        
-        token = login_data.get('token') or login_data.get('data', {}).get('token')
+        token = request.sessionToken
+
         if not token:
-            raise HTTPException(status_code=401, detail="No token received from login")
+            if not request.username or not request.password:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Authentication required: provide sessionToken or username/password",
+                )
+
+            login_data = await LiquidChartsAPI.basic_login(
+                username=request.username,
+                domain="",
+                password=request.password
+            )
+
+            token = (
+                login_data.get('token')
+                or login_data.get('sessionToken')
+                or login_data.get('sessionID')
+                or login_data.get('sessionId')
+                or login_data.get('id')
+                or (login_data.get('data') or {}).get('token')
+                or (login_data.get('data') or {}).get('sessionToken')
+                or (login_data.get('data') or {}).get('sessionID')
+                or (login_data.get('data') or {}).get('sessionId')
+                or (login_data.get('data') or {}).get('id')
+            )
+
+        if not token:
+            raise HTTPException(status_code=401, detail="Authentication failed: no usable session token")
         
         instrument = request.instrument or request.symbol
         if not instrument:

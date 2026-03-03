@@ -14,6 +14,20 @@ import { Play, Square, Clock, Calendar, AlertCircle } from 'lucide-react';
 
 const frontendHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || `http://${frontendHost}:8001`;
+const BOT_CUSTOM_CONFIG_STORAGE_KEY = 'bot_custom_config_v1';
+
+const normalizeActiveDays = (days) => {
+  if (!Array.isArray(days)) return [1, 2, 3, 4, 5];
+
+  const hasZeroBasedValue = days.some((value) => Number(value) === 0);
+  const normalized = days
+    .map((value) => Number(value))
+    .filter((value) => Number.isInteger(value))
+    .map((value) => (hasZeroBasedValue ? value + 1 : value))
+    .filter((value) => value >= 1 && value <= 7);
+
+  return normalized.length > 0 ? Array.from(new Set(normalized)).sort((a, b) => a - b) : [1, 2, 3, 4, 5];
+};
 
 const DAYS_OF_WEEK = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 
@@ -34,6 +48,31 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
   const [profitPatienceMin, setProfitPatienceMin] = useState(60);
   const [profitPatienceMax, setProfitPatienceMax] = useState(180);
   const [profitDeclineThreshold, setProfitDeclineThreshold] = useState(2);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(BOT_CUSTOM_CONFIG_STORAGE_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      const windowCfg = saved?.TRADING_WINDOW;
+
+      if (windowCfg?.START) setStartTime(windowCfg.START);
+      if (windowCfg?.END) setEndTime(windowCfg.END);
+      if (Array.isArray(saved?.ACTIVE_DAYS) && saved.ACTIVE_DAYS.length > 0) {
+        setActiveDays(normalizeActiveDays(saved.ACTIVE_DAYS));
+      }
+      if (typeof saved?.PURCHASE_AMOUNT === 'number') setPurchaseAmount(saved.PURCHASE_AMOUNT);
+      if (typeof saved?.RISK_PERCENT === 'number') setRiskPercent(saved.RISK_PERCENT * 100);
+      if (typeof saved?.STOP_LOSS_VALUE === 'number') setStopLossValue(saved.STOP_LOSS_VALUE);
+      if (typeof saved?.COOLDOWN_MINUTES === 'number') setCooldownMinutes(saved.COOLDOWN_MINUTES);
+      if (typeof saved?.CHECK_INTERVAL_SEC === 'number') setCheckIntervalSec(saved.CHECK_INTERVAL_SEC);
+      if (typeof saved?.PROFIT_PATIENCE_MIN === 'number') setProfitPatienceMin(saved.PROFIT_PATIENCE_MIN);
+      if (typeof saved?.PROFIT_PATIENCE_MAX === 'number') setProfitPatienceMax(saved.PROFIT_PATIENCE_MAX);
+      if (typeof saved?.PROFIT_DECLINE_THRESHOLD === 'number') setProfitDeclineThreshold(saved.PROFIT_DECLINE_THRESHOLD * 100);
+    } catch (_error) {
+      // Ignore malformed local storage values
+    }
+  }, []);
 
   const getDirectionLabel = (direction) => {
     const map = {
@@ -83,29 +122,35 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
   }, [selectedAccount?.accountId, botStatus?.is_running]);
 
   // Fetch current bot status
-  const fetchBotStatus = async () => {
+  const fetchBotStatus = async (showLoading = true) => {
     if (!selectedAccount?.accountId) return;
     
     try {
-      setIsLoading(true);
+      if (showLoading) setIsLoading(true);
       const response = await axios.post(`${API_BASE_URL}/api/trading/bot/status`, {
         accountId: selectedAccount.accountId
       });
       
       if (response.data.success) {
         setBotStatus(response.data.data);
+        return response.data.data;
       }
+      setBotStatus(null);
+      return null;
     } catch (err) {
       console.error('Error fetching bot status:', err);
+      return null;
     } finally {
-      setIsLoading(false);
+      if (showLoading) setIsLoading(false);
     }
   };
 
   // Start bot with current configuration
   const handleStartBot = async () => {
-    if (!selectedAccount?.accountId || !currentUser) {
-      setError('Missing account or user information');
+    const sessionToken = localStorage.getItem('liquid_session_token') || undefined;
+    const hasCredentials = !!(currentUser?.credentials?.username && currentUser?.credentials?.password);
+    if (!selectedAccount?.accountId || (!hasCredentials && !sessionToken)) {
+      setError('Missing account or authentication (session or credentials)');
       return;
     }
 
@@ -117,7 +162,7 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
 
       const customConfig = {
         TRADING_WINDOW: { START: startTime, END: endTime },
-        ACTIVE_DAYS: activeDays,
+        ACTIVE_DAYS: normalizeActiveDays(activeDays),
         PURCHASE_AMOUNT: parseFloat(purchaseAmount),
         RISK_PERCENT: riskPercent / 100,
         STOP_LOSS_VALUE: parseFloat(stopLossValue),
@@ -129,15 +174,22 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
         TIMEZONE: browserTimezone,
       };
 
+      try {
+        localStorage.setItem(BOT_CUSTOM_CONFIG_STORAGE_KEY, JSON.stringify(customConfig));
+      } catch (_error) {
+        // Ignore local storage write errors
+      }
+
       const response = await axios.post(`${API_BASE_URL}/api/trading/bot/start`, {
         accountId: selectedAccount.accountId,
         username: currentUser.credentials?.username,
         password: currentUser.credentials?.password,
+        sessionToken,
         customConfig
       });
 
       if (response.data.success) {
-        setBotStatus(response.data.data);
+        await fetchBotStatus(false);
         setError(null);
       } else {
         setError(response.data.message || 'Failed to start bot');
@@ -163,7 +215,7 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
       });
 
       if (response.data.success) {
-        setBotStatus(null);
+        await fetchBotStatus(false);
         setError(null);
       } else {
         setError(response.data.message || 'Failed to stop bot');
@@ -176,12 +228,39 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
     }
   };
 
+  const handleForceStopBot = async () => {
+    if (!selectedAccount?.accountId) return;
+
+    try {
+      setIsLoading(true);
+      setError(null);
+
+      const response = await axios.post(`${API_BASE_URL}/api/trading/bot/force-stop`, {
+        accountId: selectedAccount.accountId
+      });
+
+      if (response.data.success) {
+        setBotStatus(null);
+        await fetchBotStatus(false);
+        setError(null);
+      } else {
+        setError(response.data.message || 'Failed to force stop bot');
+      }
+    } catch (err) {
+      console.error('Error force-stopping bot:', err);
+      setError(err.response?.data?.detail || err.message);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   // Toggle day selection
   const toggleDay = (dayIndex) => {
-    if (activeDays.includes(dayIndex)) {
-      setActiveDays(activeDays.filter(d => d !== dayIndex));
+    const isoDay = dayIndex + 1;
+    if (activeDays.includes(isoDay)) {
+      setActiveDays(activeDays.filter(d => d !== isoDay));
     } else {
-      setActiveDays([...activeDays, dayIndex].sort((a, b) => a - b));
+      setActiveDays([...activeDays, isoDay].sort((a, b) => a - b));
     }
   };
 
@@ -192,6 +271,7 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
     const stateColors = {
       'idle': 'gray',
       'waiting_for_window': 'orange',
+      'waiting_for_day': 'orange',
       'monitoring_entry': 'blue',
       'in_position': 'green',
       'cooldown': 'purple',
@@ -201,6 +281,7 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
     const stateLabels = {
       'idle': 'Idle',
       'waiting_for_window': '⏰ Waiting for Window',
+      'waiting_for_day': '📅 Waiting for Active Day',
       'monitoring_entry': '👀 Monitoring Entry',
       'in_position': '📈 In Position',
       'cooldown': '💤 Cooldown',
@@ -323,7 +404,7 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
                 key={idx}
                 onClick={() => toggleDay(idx)}
                 disabled={botStatus?.is_running}
-                className={`day-button ${activeDays.includes(idx) ? 'active' : ''}`}
+                className={`day-button ${activeDays.includes(idx + 1) ? 'active' : ''}`}
               >
                 {day.slice(0, 3)}
               </button>
@@ -470,14 +551,24 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
               {isLoading ? 'Starting...' : 'Start Bot'}
             </button>
           ) : (
-            <button
-              onClick={handleStopBot}
-              disabled={isLoading}
-              className="btn btn-stop"
-            >
-              <Square size={16} />
-              {isLoading ? 'Stopping...' : 'Stop Bot'}
-            </button>
+            <>
+              <button
+                onClick={handleStopBot}
+                disabled={isLoading}
+                className="btn btn-stop"
+              >
+                <Square size={16} />
+                {isLoading ? 'Stopping...' : 'Stop Bot'}
+              </button>
+              <button
+                onClick={handleForceStopBot}
+                disabled={isLoading}
+                className="btn btn-stop"
+              >
+                <Square size={16} />
+                {isLoading ? 'Force stopping...' : 'Force Stop'}
+              </button>
+            </>
           )}
         </div>
       </div>

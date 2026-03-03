@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Line } from 'react-chartjs-2';
 import {
   Chart as ChartJS,
@@ -9,16 +9,23 @@ import {
   Tooltip,
   Legend,
 } from 'chart.js';
+import zoomPlugin from 'chartjs-plugin-zoom';
 import { useMarketFeed } from '../hooks/MarketFeedProvider';
 import { yahooFinanceClient } from '../services/yahooFinanceClient';
 
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend);
+ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend, zoomPlugin);
 
 export default function LiveChart({ ticker = 'SIM:NQ', timeframe = '1h', height = 160, sessionReady = false }) {
   const { history } = useMarketFeed();
+  const chartRef = useRef(null);
   const series = history[ticker] || [];
   const [apiSeries, setApiSeries] = useState([]);
   const [apiAuthUnavailable, setApiAuthUnavailable] = useState(false);
+  const [xViewRange, setXViewRange] = useState({ min: null, max: null });
+  const [isFollowingLatest, setIsFollowingLatest] = useState(true);
+  const autoReturnTimerRef = useRef(null);
+  const AUTO_RETURN_DELAY_MS = 5000;
+  const CHART_RIGHT_PADDING_POINTS = 40;
 
   useEffect(() => {
     let mounted = true;
@@ -102,10 +109,71 @@ export default function LiveChart({ ticker = 'SIM:NQ', timeframe = '1h', height 
   }, [series, timeframe]);
 
   const chartSeries = apiSeries.length > 0 ? apiSeries : filteredFeedSeries;
+  const paddedChartSeries = useMemo(() => {
+    if (chartSeries.length === 0) return [];
+    const lastPoint = chartSeries[chartSeries.length - 1];
+    const prevPoint = chartSeries.length > 1 ? chartSeries[chartSeries.length - 2] : null;
+    const stepMsRaw = prevPoint ? (lastPoint.ts - prevPoint.ts) : 60_000;
+    const stepMs = Number.isFinite(stepMsRaw) && stepMsRaw > 0 ? stepMsRaw : 60_000;
+    const padding = Array.from({ length: CHART_RIGHT_PADDING_POINTS }, (_, index) => ({
+      ts: lastPoint.ts + stepMs * (index + 1),
+      price: null,
+      isPadding: true,
+    }));
+    return [...chartSeries, ...padding];
+  }, [chartSeries]);
+  const followWindowSize = Math.max(30, Math.round(chartSeries.length * 0.35));
+  const followLatestRange = useMemo(() => {
+    if (chartSeries.length === 0) return { min: null, max: null };
+    const latestIndex = chartSeries.length - 1;
+    const halfWindow = Math.max(10, Math.floor(followWindowSize / 2));
+    const min = latestIndex - halfWindow;
+    const max = latestIndex + halfWindow;
+    return { min, max };
+  }, [chartSeries.length, followWindowSize]);
+
+  const isNearFollowRange = (min, max) => {
+    if (!Number.isFinite(min) || !Number.isFinite(max)) return false;
+    if (!Number.isFinite(followLatestRange.min) || !Number.isFinite(followLatestRange.max)) return false;
+    return Math.abs(min - followLatestRange.min) <= 1 && Math.abs(max - followLatestRange.max) <= 1;
+  };
+
+  const clearAutoReturnTimer = () => {
+    if (!autoReturnTimerRef.current) return;
+    clearTimeout(autoReturnTimerRef.current);
+    autoReturnTimerRef.current = null;
+  };
+
+  const scheduleAutoReturnToLatest = () => {
+    clearAutoReturnTimer();
+    autoReturnTimerRef.current = setTimeout(() => {
+      setIsFollowingLatest(true);
+      if (Number.isFinite(followLatestRange.min) && Number.isFinite(followLatestRange.max)) {
+        setXViewRange({ min: followLatestRange.min, max: followLatestRange.max });
+      }
+    }, AUTO_RETURN_DELAY_MS);
+  };
+
+  useEffect(() => {
+    if (!isFollowingLatest) return;
+    clearAutoReturnTimer();
+    if (!Number.isFinite(followLatestRange.min) || !Number.isFinite(followLatestRange.max)) return;
+    setXViewRange({ min: followLatestRange.min, max: followLatestRange.max });
+  }, [isFollowingLatest, followLatestRange.min, followLatestRange.max]);
+
+  useEffect(() => {
+    return () => {
+      clearAutoReturnTimer();
+    };
+  }, []);
+
+  useEffect(() => {
+    setIsFollowingLatest(true);
+  }, [ticker, timeframe]);
 
   const data = useMemo(() => {
-    const labels = chartSeries.map(p => new Date(p.ts).toLocaleTimeString());
-    const values = chartSeries.map(p => p.price);
+    const labels = paddedChartSeries.map(p => new Date(p.ts).toLocaleTimeString());
+    const values = paddedChartSeries.map(p => (p.isPadding ? null : p.price));
     return {
       labels,
       datasets: [{
@@ -118,21 +186,79 @@ export default function LiveChart({ ticker = 'SIM:NQ', timeframe = '1h', height 
         borderWidth: 2,
       }]
     };
-  }, [chartSeries, ticker]);
+  }, [paddedChartSeries, ticker]);
 
   const options = useMemo(() => ({
     responsive: true,
     maintainAspectRatio: false,
-    plugins: { legend: { display: false } },
+    plugins: {
+      legend: { display: false },
+      zoom: {
+        zoom: {
+          wheel: {
+            enabled: true,
+            speed: 0.08,
+          },
+          pinch: {
+            enabled: true,
+          },
+          drag: {
+            enabled: true,
+            backgroundColor: 'rgba(6, 182, 212, 0.12)',
+            borderColor: 'rgba(6, 182, 212, 0.4)',
+            borderWidth: 1,
+            threshold: 6,
+          },
+          mode: 'x',
+        },
+        pan: {
+          enabled: true,
+          mode: 'x',
+          threshold: 2,
+        },
+        onZoomComplete: ({ chart }) => {
+          const scaleX = chart?.scales?.x;
+          if (!scaleX) return;
+          if (Number.isFinite(scaleX.min) && Number.isFinite(scaleX.max)) {
+            if (isNearFollowRange(scaleX.min, scaleX.max)) {
+              setIsFollowingLatest(true);
+              setXViewRange({ min: followLatestRange.min, max: followLatestRange.max });
+              return;
+            }
+            setIsFollowingLatest(false);
+            setXViewRange({ min: scaleX.min, max: scaleX.max });
+            scheduleAutoReturnToLatest();
+          }
+        },
+        onPanComplete: ({ chart }) => {
+          const scaleX = chart?.scales?.x;
+          if (!scaleX) return;
+          if (Number.isFinite(scaleX.min) && Number.isFinite(scaleX.max)) {
+            if (isNearFollowRange(scaleX.min, scaleX.max)) {
+              setIsFollowingLatest(true);
+              setXViewRange({ min: followLatestRange.min, max: followLatestRange.max });
+              return;
+            }
+            setIsFollowingLatest(false);
+            setXViewRange({ min: scaleX.min, max: scaleX.max });
+            scheduleAutoReturnToLatest();
+          }
+        },
+      },
+    },
     scales: { 
-      x: { display: false }, 
+      x: {
+        display: false,
+        ...(Number.isFinite(xViewRange.min) ? { min: xViewRange.min } : {}),
+        ...(Number.isFinite(xViewRange.max) ? { max: xViewRange.max } : {}),
+      }, 
       y: { display: false } 
     }
-  }), []);
+  }), [xViewRange.min, xViewRange.max, followLatestRange.min, followLatestRange.max, AUTO_RETURN_DELAY_MS]);
 
   return (
     <div style={{ height }} className="w-full">
-      <Line data={data} options={options} />
+      <Line ref={chartRef} data={data} options={options} />
     </div>
   );
 }

@@ -66,3 +66,35 @@ uvicorn main:app --reload --port 8000
 
 - If `http://127.0.0.1:8000/openapi.json` loads, backend may be running in another terminal/process.
 - Check active Python/uvicorn processes and terminate duplicates.
+
+## Deploy 24/7 (Render)
+
+This repo now includes production deployment files:
+
+- Docker image config: [backend/Dockerfile](backend/Dockerfile)
+- Render service config: [render.yaml](render.yaml)
+- Environment template: [backend/.env.example](backend/.env.example)
+
+### Steps
+
+1. Push this repository to GitHub.
+2. In Render, click **New +** → **Blueprint**.
+3. Select this repo; Render reads [render.yaml](render.yaml) and creates backend service.
+4. Wait for deploy to finish.
+5. Copy your backend public URL (example: `https://stock-trading-backend.onrender.com`).
+
+### Verify backend is live
+
+Open:
+
+`https://YOUR_RENDER_URL/api/trading`
+
+You should get a JSON success response.
+
+### Connect mobile app to cloud backend
+
+In app Login screen, set **Backend API URL** to:
+
+`https://YOUR_RENDER_URL/api/trading`
+
+After this, your app login works anytime without running backend on your PC.

@@ -1,0 +1,11 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "test-yahoo-cache-logic",
+			"type": "shell",
+			"command": "python tmp_test_yahoo_cache_logic.py",
+			"isBackground": false
+		}
+	]
+}

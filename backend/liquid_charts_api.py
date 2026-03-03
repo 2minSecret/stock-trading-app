@@ -251,7 +251,7 @@ class LiquidChartsAPI:
         If LIQUID_BASIC_AUTH_PREFIX is explicitly set, no retry is performed.
         """
         explicit_prefix = bool(LIQUID_BASIC_AUTH_PREFIX)
-        prefixes = [LIQUID_BASIC_AUTH_PREFIX] if explicit_prefix else ["", "DXAPI "]
+        prefixes = [LIQUID_BASIC_AUTH_PREFIX] if explicit_prefix else ["DXAPI ", ""]
 
         last_error: Optional[httpx.HTTPStatusError] = None
         for prefix in prefixes:
@@ -313,16 +313,45 @@ class LiquidChartsAPI:
     @staticmethod
     async def basic_login(username: str, domain: str, password: str) -> Dict[str, Any]:
         """Create a Basic Auth session token"""
-        try:
-            response = await get_client().post(
-                f"{LIQUID_METRICS_BASE}/dxsca-web/login",
-                json={"username": username, "domain": domain, "password": password}
-            )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            print(f"Basic login error: {e}")
-            raise
+        requested_domain = (domain or "").strip()
+        domain_candidates: list[str] = []
+
+        for candidate in (
+            requested_domain,
+            "default" if not requested_domain else "",
+        ):
+            if candidate not in domain_candidates:
+                domain_candidates.append(candidate)
+
+        last_error: Optional[httpx.HTTPStatusError] = None
+
+        for index, domain_candidate in enumerate(domain_candidates):
+            try:
+                response = await get_client().post(
+                    f"{LIQUID_METRICS_BASE}/dxsca-web/login",
+                    json={"username": username, "domain": domain_candidate, "password": password}
+                )
+                response.raise_for_status()
+                if index > 0:
+                    print(f"INFO: basic_login succeeded with fallback domain '{domain_candidate or '<empty>'}'")
+                return response.json()
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                if e.response.status_code in (401, 403) and index < len(domain_candidates) - 1:
+                    print(
+                        "WARN: basic_login failed with domain "
+                        f"'{domain_candidate or '<empty>'}' (status {e.response.status_code}); retrying fallback domain"
+                    )
+                    continue
+                raise
+            except httpx.HTTPError as e:
+                print(f"Basic login error: {e}")
+                raise
+
+        if last_error:
+            raise last_error
+
+        raise httpx.HTTPStatusError("Basic login failed", request=None, response=None)
 
     @staticmethod
     async def basic_logout(token: str) -> Dict[str, Any]:
@@ -386,6 +415,7 @@ class LiquidChartsAPI:
             last_error: Optional[httpx.HTTPStatusError] = None
 
             for index, payload_variant in enumerate(variants):
+                did_ping_retry = False
                 try:
                     print(f"DEBUG: Trying marketdata variant #{index + 1}: {json.dumps(payload_variant)}")
                     if auth_type == "basic" and token:
@@ -407,6 +437,28 @@ class LiquidChartsAPI:
                         print(f"INFO: marketdata succeeded with compatibility payload variant #{index + 1}")
                     return response.json()
                 except httpx.HTTPStatusError as e:
+                    if (
+                        auth_type == "basic"
+                        and token
+                        and e.response.status_code in (401, 403)
+                        and not did_ping_retry
+                    ):
+                        did_ping_retry = True
+                        try:
+                            print("WARN: marketdata unauthorized; attempting basic_ping and one retry")
+                            await LiquidChartsAPI.basic_ping(token)
+                            response = await LiquidChartsAPI._dxsca_request_with_basic_retry(
+                                "POST",
+                                f"{LIQUID_METRICS_BASE}/dxsca-web/marketdata",
+                                token=token,
+                                json_body=payload_variant,
+                            )
+                            response.raise_for_status()
+                            print(f"INFO: marketdata recovered after basic_ping on variant #{index + 1}")
+                            return response.json()
+                        except Exception as ping_retry_error:
+                            print(f"WARN: basic_ping retry failed: {ping_retry_error}")
+
                     last_error = e
                     # Retry on 400 errors that indicate request format issues
                     # (eventTypes errors, parameter validation errors, etc.)

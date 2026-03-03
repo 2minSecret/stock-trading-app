@@ -1,0 +1,5 @@
+{
+  "appId": "com.stocktrading.app",
+  "appName": "StockTradingApp",
+  "webDir": "dist"
+}

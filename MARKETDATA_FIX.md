@@ -33,7 +33,7 @@ Enhanced error messages to show which variant was rejected and why, making debug
 ## Testing
 
 ### Local Test Command
-From the `backend/` directory:
+From the workspace root:
 
 ```bash
 # Ensure backend is running on port 8001

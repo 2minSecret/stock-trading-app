@@ -1,0 +1,54 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "verify-marketdata",
+			"type": "shell",
+			"command": "python tmp_verify_marketdata_bot.py",
+			"args": [],
+			"isBackground": false
+		},
+		{
+			"label": "check-or-refresh-token",
+			"type": "shell",
+			"command": "python tmp_check_or_refresh_token.py",
+			"isBackground": false
+		},
+		{
+			"label": "probe-yahoo-cache",
+			"type": "shell",
+			"command": "python tmp_yahoo_probe.py",
+			"isBackground": false
+		},
+		{
+			"label": "check-httpx",
+			"type": "shell",
+			"command": "python -c \"import sys; print('PY=' + sys.executable); import httpx; print('HTTPX_OK=1')\"",
+			"isBackground": false
+		},
+		{
+			"label": "force-delete-backend-venv",
+			"type": "shell",
+			"command": "cmd /c \"taskkill /f /im python.exe >nul 2>nul & taskkill /f /im py.exe >nul 2>nul & del /f /q backend\\venv\\Scripts\\python.exe >nul 2>nul & rmdir /s /q backend\\venv & if exist backend\\venv (echo BACKEND_VENV_EXISTS=1) else (echo BACKEND_VENV_EXISTS=0)\"",
+			"isBackground": false
+		},
+		{
+			"label": "probe-marketdata-quote",
+			"type": "shell",
+			"command": "C:/Users/User/AppData/Local/Programs/Python/Python312/python.exe",
+			"args": [
+				"tmp_marketdata_quote_probe.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "e2e-buy-sell-check",
+			"type": "shell",
+			"command": "C:/Users/User/AppData/Local/Programs/Python/Python312/python.exe",
+			"args": [
+				"tmp_e2e_buy_sell_check.py"
+			],
+			"isBackground": false
+		}
+	]
+}

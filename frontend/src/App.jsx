@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { TrendingUp, TrendingDown, Home, Bell, Settings, PieChart, LogOut, BarChart3 } from 'lucide-react';
 import { MarketFeedProvider } from './hooks/MarketFeedProvider';
 import LiveChart from './components/LiveChart';
@@ -17,6 +17,9 @@ import { useMarketFeed } from './hooks/MarketFeedProvider';
 const DEFAULT_TRADE_ACCOUNTS = [
   { code: 'default:DEM_3063067_1', label: 'Demo Account', mode: 'demo' },
 ];
+const PNL_HISTORY_STORAGE_KEY = 'pnl_history_v1';
+const PNL_HISTORY_MAX_POINTS = 500;
+const PNL_HISTORY_SAMPLE_MS = 60 * 1000;
 
 function loadTradeAccounts() {
   try {
@@ -107,6 +110,26 @@ function extractFirstRecord(payload, preferredKeys = []) {
   return payload;
 }
 
+function loadPnlHistory() {
+  try {
+    const raw = localStorage.getItem(PNL_HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((row) => row && Number.isFinite(Number(row.ts)) && Number.isFinite(Number(row.value)))
+      .map((row) => ({
+        ts: Number(row.ts),
+        value: Number(row.value),
+        accountCode: String(row.accountCode || ''),
+        currency: String(row.currency || 'USD'),
+      }))
+      .sort((a, b) => a.ts - b.ts);
+  } catch {
+    return [];
+  }
+}
+
 function App() {
   const { connectionStatus } = useMarketFeed();
 
@@ -155,6 +178,7 @@ function App() {
   const [displayCurrency] = useState('USD');
   const [conversionRate, setConversionRate] = useState(1);
   const [conversionError, setConversionError] = useState('');
+  const [pnlHistoryRows, setPnlHistoryRows] = useState(() => loadPnlHistory());
 
   useEffect(() => {
     if (tradingView === '^IXIC') {
@@ -354,7 +378,7 @@ function App() {
     };
 
     refresh();
-    const timer = setInterval(refresh, 8000);
+    const timer = setInterval(refresh, 3000);
 
     return () => {
       mounted = false;
@@ -570,6 +594,72 @@ function App() {
   const convertedLiveEquity = liveEquity !== null ? liveEquity * conversionRate : null;
   const convertedLivePnl = livePnl !== null ? livePnl * conversionRate : null;
   const convertedAccountBalance = accountBalance !== null ? accountBalance * conversionRate : null;
+
+  useEffect(() => {
+    if (!isLoggedIn || !sessionReady || !selectedAccountCode) return;
+    if (!Number.isFinite(convertedLivePnl)) return;
+
+    setPnlHistoryRows((prev) => {
+      const history = Array.isArray(prev) ? prev : [];
+      const accountHistory = history.filter((row) => row.accountCode === selectedAccountCode);
+      const lastForAccount = accountHistory.length > 0 ? accountHistory[accountHistory.length - 1] : null;
+      const now = Date.now();
+
+      if (lastForAccount && now - lastForAccount.ts < PNL_HISTORY_SAMPLE_MS) {
+        return prev;
+      }
+
+      const next = [
+        ...history,
+        {
+          ts: now,
+          value: Number(convertedLivePnl.toFixed(2)),
+          accountCode: selectedAccountCode,
+          currency: displayCurrency,
+        },
+      ];
+
+      if (next.length > PNL_HISTORY_MAX_POINTS) {
+        return next.slice(next.length - PNL_HISTORY_MAX_POINTS);
+      }
+
+      return next;
+    });
+  }, [isLoggedIn, sessionReady, selectedAccountCode, convertedLivePnl, displayCurrency]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PNL_HISTORY_STORAGE_KEY, JSON.stringify(pnlHistoryRows));
+    } catch {
+      // Ignore storage errors
+    }
+  }, [pnlHistoryRows]);
+
+  const selectedAccountPnlHistory = useMemo(() => {
+    if (!selectedAccountCode) return [];
+    return pnlHistoryRows.filter((row) => row.accountCode === selectedAccountCode);
+  }, [pnlHistoryRows, selectedAccountCode]);
+
+  const recentPnlHistory = useMemo(() => {
+    return selectedAccountPnlHistory.slice(-12).reverse();
+  }, [selectedAccountPnlHistory]);
+
+  const pnlHistoryOverview = useMemo(() => {
+    if (selectedAccountPnlHistory.length === 0) {
+      return { change: null, min: null, max: null, points: 0 };
+    }
+
+    const first = selectedAccountPnlHistory[0].value;
+    const last = selectedAccountPnlHistory[selectedAccountPnlHistory.length - 1].value;
+    const values = selectedAccountPnlHistory.map((row) => row.value);
+
+    return {
+      change: last - first,
+      min: Math.min(...values),
+      max: Math.max(...values),
+      points: selectedAccountPnlHistory.length,
+    };
+  }, [selectedAccountPnlHistory]);
   const hasLiquidSessionToken = !!localStorage.getItem('liquid_session_token');
   const metricsStatus = metricsError
     ? 'Error'
@@ -598,67 +688,6 @@ function App() {
   // Allow placeholder demo accounts for testing, but not placeholder live accounts
   const isPlaceholderLiveAccount = isSelectedAccountPlaceholder && isLiveAccountSelected;
   const isOrderDisabled = isPlacingOrder || !selectedTradeAccount || isLiveBlocked || isPlaceholderLiveAccount;
-
-  const handlePlaceOrder = async (side) => {
-    setOrderStatus('');
-    setOrderError('');
-
-    if (!selectedTradeAccount) {
-      setOrderError('Select an account before placing an order.');
-      return;
-    }
-
-    // Allow demo placeholder accounts, but require real accounts for live trading
-    if (isSelectedAccountPlaceholder && isLiveAccountSelected) {
-      setOrderError('Live trading requires a real Liquid account code. Select a real account before placing an order.');
-      return;
-    }
-
-    if (isLiveAccountSelected && !liveTradingEnabled) {
-      setOrderError('Live account is blocked. Enable live trading explicitly to continue.');
-      return;
-    }
-
-    const quantityInput = window.prompt('Order quantity:', '1');
-    if (quantityInput === null) return;
-    const quantity = Number(quantityInput);
-    if (!Number.isFinite(quantity) || quantity <= 0) {
-      setOrderError('Quantity must be a positive number.');
-      return;
-    }
-
-    const priceInput = window.prompt('Limit price (leave empty for market order):', '');
-    if (priceInput === null) return;
-    const trimmedPrice = priceInput.trim();
-    const hasLimitPrice = trimmedPrice.length > 0;
-    const limitPrice = hasLimitPrice ? Number(trimmedPrice) : undefined;
-    if (hasLimitPrice && (!Number.isFinite(limitPrice) || limitPrice <= 0)) {
-      setOrderError('Limit price must be a positive number.');
-      return;
-    }
-
-    setIsPlacingOrder(true);
-    try {
-      await liquidTrading.placeAccountOrder({
-        accountCode: selectedTradeAccount.code,
-        order: {
-          symbol: selectedTicker,
-          side: side.toUpperCase(),
-          type: hasLimitPrice ? 'LIMIT' : 'MARKET',
-          quantity,
-          ...(hasLimitPrice ? { price: limitPrice } : {}),
-          timeInForce: 'GTC',
-        },
-      });
-      setOrderStatus(`${side.toUpperCase()} order submitted to ${selectedTradeAccount.label} (${selectedTradeAccount.code}).`);
-      refreshAccountViews();
-    } catch (error) {
-      const detail = error?.response?.data?.detail;
-      setOrderError(typeof detail === 'string' ? detail : 'Order submission failed.');
-    } finally {
-      setIsPlacingOrder(false);
-    }
-  };
 
   const handlePlaceBracketOrder = useCallback(async ({ side, quantity, entryType, entryPrice, stopLossPrice, takeProfitPrice, instrument }) => {
     if (!selectedTradeAccount) {
@@ -1049,55 +1078,6 @@ function App() {
                   <LiveChart ticker={selectedTicker} timeframe={timeframe} height={160} sessionReady={sessionReady} />
                 </div>
 
-                {/* Action Buttons */}
-                <div className="flex gap-3 mt-3">
-                  <button
-                    onClick={() => handlePlaceOrder('sell')}
-                    disabled={isOrderDisabled}
-                    className={`flex-1 py-3 rounded-xl font-semibold transition duration-200 text-sm border ${
-                      isOrderDisabled
-                        ? 'bg-red-900/10 text-red-300/40 border-red-900/20 cursor-not-allowed'
-                        : 'bg-red-900/20 hover:bg-red-900/30 text-red-400 hover:text-red-300 border-red-900/30 hover:border-red-800/50'
-                    }`}
-                  >
-                    {isPlacingOrder ? 'Submitting...' : 'Sell'}
-                  </button>
-                  <button
-                    onClick={() => handlePlaceOrder('buy')}
-                    disabled={isOrderDisabled}
-                    className={`flex-1 py-3 rounded-xl font-semibold transition duration-200 text-sm border shadow-lg shadow-cyan-900/10 ${
-                      isOrderDisabled
-                        ? 'bg-cyan-900/10 text-cyan-300/40 border-cyan-900/20 cursor-not-allowed'
-                        : 'bg-cyan-600/20 hover:bg-cyan-600/30 text-cyan-400 hover:text-cyan-300 border-cyan-500/30 hover:border-cyan-400/50'
-                    }`}
-                  >
-                    {isPlacingOrder ? 'Submitting...' : 'Buy'}
-                  </button>
-                </div>
-                <button
-                  onClick={handleModifyOrder}
-                  disabled={isOrderDisabled}
-                  className={`w-full mt-2 py-2.5 rounded-xl font-semibold transition duration-200 text-sm border ${
-                    isOrderDisabled
-                      ? 'bg-gray-800/30 text-gray-500 border-gray-700/30 cursor-not-allowed'
-                      : 'bg-gray-800/60 hover:bg-gray-700/70 text-gray-200 border-gray-700/50 hover:border-gray-600/70'
-                  }`}
-                >
-                  {isPlacingOrder ? 'Submitting...' : 'Modify Order'}
-                </button>
-                <button
-                  onClick={handleCancelOrder}
-                  disabled={isOrderDisabled}
-                  className={`w-full mt-2 py-2.5 rounded-xl font-semibold transition duration-200 text-sm border ${
-                    isOrderDisabled
-                      ? 'bg-red-900/10 text-red-300/40 border-red-900/20 cursor-not-allowed'
-                      : 'bg-red-900/20 hover:bg-red-900/30 text-red-300 border-red-800/40 hover:border-red-700/60'
-                  }`}
-                >
-                  {isPlacingOrder ? 'Submitting...' : 'Cancel Order'}
-                </button>
-                {orderStatus && <p className="text-xs text-cyan-400 mt-1">{orderStatus}</p>}
-                {orderError && <p className="text-xs text-red-400 mt-1">{orderError}</p>}
              </section>
 
              {/* Markets + Portfolio sections */}
@@ -1105,6 +1085,53 @@ function App() {
                <MarketsPanel />
                <PortfolioBar accountMetrics={accountMetrics} />
              </div>
+
+             <section className="bg-gradient-to-br from-gray-900 to-gray-950 rounded-2xl p-4 border border-gray-800/50">
+               <div className="flex items-center justify-between mb-3">
+                 <h4 className="text-sm font-semibold text-white">P/L History</h4>
+                 <span className="text-[10px] uppercase tracking-wider text-gray-500">{pnlHistoryOverview.points} points</span>
+               </div>
+
+               {selectedAccountPnlHistory.length === 0 ? (
+                 <p className="text-xs text-gray-500">No P/L history yet. Keep the app open to collect trend points over time.</p>
+               ) : (
+                 <>
+                   <div className="grid grid-cols-3 gap-2 mb-3">
+                     <div className="bg-gray-800/40 border border-gray-700/30 rounded-lg px-2.5 py-2">
+                       <p className="text-[10px] uppercase tracking-wider text-gray-500">Change</p>
+                       <p className={`text-xs font-semibold ${Number(pnlHistoryOverview.change) >= 0 ? 'text-cyan-400' : 'text-red-400'}`}>
+                         {pnlHistoryOverview.change !== null
+                           ? `${Number(pnlHistoryOverview.change) >= 0 ? '+' : ''}$${Number(pnlHistoryOverview.change).toFixed(2)}`
+                           : '—'}
+                       </p>
+                     </div>
+                     <div className="bg-gray-800/40 border border-gray-700/30 rounded-lg px-2.5 py-2">
+                       <p className="text-[10px] uppercase tracking-wider text-gray-500">Min</p>
+                       <p className="text-xs font-semibold text-red-400">
+                         {pnlHistoryOverview.min !== null ? `$${Number(pnlHistoryOverview.min).toFixed(2)}` : '—'}
+                       </p>
+                     </div>
+                     <div className="bg-gray-800/40 border border-gray-700/30 rounded-lg px-2.5 py-2">
+                       <p className="text-[10px] uppercase tracking-wider text-gray-500">Max</p>
+                       <p className="text-xs font-semibold text-cyan-400">
+                         {pnlHistoryOverview.max !== null ? `$${Number(pnlHistoryOverview.max).toFixed(2)}` : '—'}
+                       </p>
+                     </div>
+                   </div>
+
+                   <div className="space-y-2 max-h-52 overflow-y-auto">
+                     {recentPnlHistory.map((row) => (
+                       <div key={`${row.accountCode}-${row.ts}`} className="flex items-center justify-between text-xs bg-gray-800/40 border border-gray-700/30 rounded-lg px-3 py-2">
+                         <span className="text-gray-300">{new Date(row.ts).toLocaleString()}</span>
+                         <span className={`${row.value >= 0 ? 'text-cyan-400' : 'text-red-400'} font-semibold`}>
+                           {row.value >= 0 ? '+' : ''}${row.value.toFixed(2)} {row.currency || displayCurrency}
+                         </span>
+                       </div>
+                     ))}
+                   </div>
+                 </>
+               )}
+             </section>
 
              {accountDataError && (
                <div className="text-xs text-amber-400 border border-amber-500/20 bg-amber-500/5 rounded-xl px-3 py-2">
@@ -1232,6 +1259,12 @@ function App() {
             isLiveBlocked={isLiveBlocked}
             onPlaceBracketOrder={handlePlaceBracketOrder}
             onPlaceTouchCloseOrder={handlePlaceTouchCloseOrder}
+            onModifyOrder={handleModifyOrder}
+            onCancelOrder={handleCancelOrder}
+            isOrderActionSubmitting={isPlacingOrder}
+            isOrderActionDisabled={isOrderDisabled}
+            orderHistoryRows={orderHistoryRows}
+            accountEventRows={eventRows}
           />
         )}
        </main>
