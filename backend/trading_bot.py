@@ -130,6 +130,7 @@ class TradingBot:
         self.last_movement_check_at: Optional[datetime] = None
         self.last_movement_signal: Optional[Dict[str, Any]] = None
         self.last_entry_signal: Optional[Dict[str, Any]] = None
+        self.last_exit_signal: Optional[Dict[str, Any]] = None
         self.blocked_by: Optional[str] = None
         self.blocked_details: Optional[Dict[str, Any]] = None
         self.cached_quote: Optional[Dict[str, Any]] = None
@@ -394,6 +395,7 @@ class TradingBot:
                 self.profit_analyzer.reset()
                 self.last_movement_check_at = None
                 self.last_movement_signal = None
+                self.last_exit_signal = None
                 
                 self.stats['trades_executed'] += 1
                 self.stats['last_trade_at'] = self._now().isoformat()
@@ -443,6 +445,7 @@ class TradingBot:
             if touch_trigger:
                 sl_value = f"{self.stop_loss_price:.2f}" if self.stop_loss_price is not None else "n/a"
                 tp_value = f"{self.take_profit_price:.2f}" if self.take_profit_price is not None else "n/a"
+                realized_profit = (current_price - self.entry_price) if self.entry_price is not None else 0.0
                 logger.warning(
                     f"🎯 {touch_trigger.upper()} TOUCH TRIGGERED: range=[{observed_low:.2f}, {observed_high:.2f}] "
                     f"SL={sl_value} TP={tp_value}"
@@ -452,17 +455,34 @@ class TradingBot:
                     trigger_type=touch_trigger,
                 )
 
-                profit = current_price - self.entry_price if self.entry_price else 0.0
+                if realized_profit > 0:
+                    self.stats['wins'] += 1
+                else:
+                    self.stats['losses'] += 1
+                self.stats['total_profit'] += realized_profit
+                return
+            
+            # Calculate profit/loss
+            profit = current_price - self.entry_price
+            profit_pct = (profit / self.entry_price) * 100
+
+            exit_signal = await self._analyze_exit_signal(
+                current_price=float(current_price),
+                profit=float(profit),
+            )
+            self.last_exit_signal = exit_signal
+
+            if exit_signal.get("force_sell"):
+                reason = exit_signal.get("reason", "Line-touch bearish exit")
+                logger.warning(f"📉 EXIT LINE-SIGNAL: {reason}")
+                await self._close_position(reason)
+
                 if profit > 0:
                     self.stats['wins'] += 1
                 else:
                     self.stats['losses'] += 1
                 self.stats['total_profit'] += profit
                 return
-            
-            # Calculate profit/loss
-            profit = current_price - self.entry_price
-            profit_pct = (profit / self.entry_price) * 100
             
             logger.debug(f"📊 Position P/L: ${profit:.2f} ({profit_pct:.2f}%)")
             
@@ -491,27 +511,39 @@ class TradingBot:
                 self.last_movement_check_at = now
 
                 if movement_signal.get('action') in ['SELL_CUT_LOSS', 'SELL_PROTECT_PROFIT']:
-                    logger.warning(f"📉 MOVEMENT EXIT SIGNAL: {movement_signal.get('reason')}")
-                    await self._close_position(movement_signal.get('reason', 'Bearish movement forecast'))
+                    if exit_signal.get("prefer_hold"):
+                        logger.info(
+                            "✋ HOLD movement sell due to bullish line-touch context: "
+                            f"{exit_signal.get('reason')}"
+                        )
+                    else:
+                        logger.warning(f"📉 MOVEMENT EXIT SIGNAL: {movement_signal.get('reason')}")
+                        await self._close_position(movement_signal.get('reason', 'Bearish movement forecast'))
 
+                        if profit > 0:
+                            self.stats['wins'] += 1
+                        else:
+                            self.stats['losses'] += 1
+                        self.stats['total_profit'] += profit
+                        return
+            
+            # Decision logic
+            if analysis['action'] in ['SELL_IMMEDIATE', 'SELL_TIMEOUT']:
+                if exit_signal.get("prefer_hold"):
+                    logger.info(
+                        "✋ HOLD profit-analyzer sell due to bullish line-touch context: "
+                        f"{exit_signal.get('reason')}"
+                    )
+                else:
+                    logger.info(f"💰 EXIT SIGNAL: {analysis['reason']}")
+                    await self._close_position(analysis['reason'])
+                    
                     if profit > 0:
                         self.stats['wins'] += 1
                     else:
                         self.stats['losses'] += 1
+                        
                     self.stats['total_profit'] += profit
-                    return
-            
-            # Decision logic
-            if analysis['action'] in ['SELL_IMMEDIATE', 'SELL_TIMEOUT']:
-                logger.info(f"💰 EXIT SIGNAL: {analysis['reason']}")
-                await self._close_position(analysis['reason'])
-                
-                if profit > 0:
-                    self.stats['wins'] += 1
-                else:
-                    self.stats['losses'] += 1
-                    
-                self.stats['total_profit'] += profit
             else:
                 logger.debug(f"✋ HOLD: {analysis['reason']}")
         
@@ -563,6 +595,7 @@ class TradingBot:
             self.stop_loss_price = None
             self.take_profit_price = None
             self.last_observed_price = None
+            self.last_exit_signal = None
             
             # Start cooldown
             self.cooldown_until = self._now() + timedelta(minutes=self.config.cooldown_minutes)
@@ -609,6 +642,138 @@ class TradingBot:
         if observed_high >= self.stop_loss_price:
             return "stop_loss"
         return None
+
+    async def _analyze_exit_signal(self, current_price: float, profit: float) -> Dict[str, Any]:
+        """Build smarter SELL/HOLD signal from recent structure and support/resistance touches."""
+        timeframe_minutes = max(1, self._timeframe_to_minutes(self.config.entry_timeframe))
+        candles_last_hour = max(6, int(round(60 / timeframe_minutes)))
+
+        candles = await self._get_market_candles(
+            timeframe=self.config.entry_timeframe,
+            limit=max(candles_last_hour + 6, 16),
+        )
+        if not candles:
+            return {
+                "force_sell": False,
+                "prefer_hold": False,
+                "reason": "No candle data for exit line-touch analysis",
+            }
+
+        normalized: List[Dict[str, float]] = []
+        for candle in candles:
+            close_v = self._to_float(candle.get("close"))
+            open_v = self._to_float(candle.get("open"))
+            high_v = self._to_float(candle.get("high"))
+            low_v = self._to_float(candle.get("low"))
+            if (
+                close_v is None
+                or open_v is None
+                or high_v is None
+                or low_v is None
+                or close_v <= 0
+                or open_v <= 0
+                or high_v <= 0
+                or low_v <= 0
+            ):
+                continue
+            normalized.append({
+                "open": float(open_v),
+                "high": float(high_v),
+                "low": float(low_v),
+                "close": float(close_v),
+            })
+
+        if len(normalized) < 8:
+            return {
+                "force_sell": False,
+                "prefer_hold": False,
+                "reason": "Insufficient candles for exit line-touch analysis",
+                "samples": len(normalized),
+            }
+
+        recent = normalized[-min(len(normalized), candles_last_hour):]
+        support_line = min((row["low"] for row in recent), default=current_price)
+        resistance_line = max((row["high"] for row in recent), default=current_price)
+        range_size = max(resistance_line - support_line, 0.0)
+
+        line_tolerance_pct = max(0.0005, abs(float(self.config.entry_min_trend_pct)) * 1.5)
+
+        def _is_touch(value: float, line: float) -> bool:
+            if line <= 0:
+                return False
+            return abs(value - line) / line <= line_tolerance_pct
+
+        touch_window = recent[-min(6, len(recent)):]
+        support_touches = sum(1 for row in touch_window if _is_touch(row["low"], support_line))
+        resistance_touches = sum(1 for row in touch_window if _is_touch(row["high"], resistance_line))
+
+        reaction_window = touch_window[-min(3, len(touch_window)):]
+        bearish_resistance_rejection = any(
+            _is_touch(row["high"], resistance_line) and row["close"] < row["open"]
+            for row in reaction_window
+        )
+        bullish_support_bounce = any(
+            _is_touch(row["low"], support_line) and row["close"] > row["open"]
+            for row in reaction_window
+        )
+
+        half = max(2, len(recent) // 2)
+        first_half = recent[:half]
+        second_half = recent[-half:]
+        first_half_high = max((row["high"] for row in first_half), default=current_price)
+        second_half_high = max((row["high"] for row in second_half), default=current_price)
+        first_half_low = min((row["low"] for row in first_half), default=current_price)
+        second_half_low = min((row["low"] for row in second_half), default=current_price)
+
+        structure_down = (second_half_high <= first_half_high) and (second_half_low <= first_half_low)
+        structure_up = (second_half_high >= first_half_high) and (second_half_low >= first_half_low)
+
+        position_in_range = 0.5
+        if range_size > 0:
+            position_in_range = (current_price - support_line) / range_size
+            position_in_range = min(max(position_in_range, 0.0), 1.0)
+
+        force_sell = False
+        force_reason = None
+        if self.entry_side == "BUY":
+            if bearish_resistance_rejection and (position_in_range >= 0.65 or profit > 0):
+                force_sell = True
+                force_reason = "Line-touch exit: bearish rejection near resistance"
+            elif structure_down and resistance_touches >= 1 and profit > 0:
+                force_sell = True
+                force_reason = "Line-touch exit: last-hour structure turned down"
+
+        prefer_hold = False
+        hold_reason = None
+        if self.entry_side == "BUY":
+            if bullish_support_bounce and not structure_down:
+                prefer_hold = True
+                hold_reason = "Line-touch hold: bullish support bounce"
+            elif structure_up and position_in_range <= 0.55 and not bearish_resistance_rejection:
+                prefer_hold = True
+                hold_reason = "Line-touch hold: structure still bullish"
+
+        reason = force_reason or hold_reason or "Line-touch exit context neutral"
+        return {
+            "force_sell": force_sell,
+            "prefer_hold": prefer_hold,
+            "reason": reason,
+            "metrics": {
+                "support_line": support_line,
+                "resistance_line": resistance_line,
+                "line_tolerance_pct": line_tolerance_pct,
+                "support_touches": support_touches,
+                "resistance_touches": resistance_touches,
+                "bullish_support_bounce": bullish_support_bounce,
+                "bearish_resistance_rejection": bearish_resistance_rejection,
+                "structure_up": structure_up,
+                "structure_down": structure_down,
+                "position_in_range_pct": position_in_range,
+                "candles_last_hour_used": len(recent),
+                "profit": profit,
+                "price": current_price,
+            },
+        }
 
     def _extract_position_code_from_result(self, order_result: Dict[str, Any]) -> Optional[str]:
         """Extract position code from varied order response payload shapes."""
@@ -976,6 +1141,24 @@ class TradingBot:
         parsed.sort(key=lambda x: x.get("ts", 0.0))
         return parsed
 
+    def _timeframe_to_minutes(self, timeframe: str) -> int:
+        tf = str(timeframe or "5m").strip().lower()
+        mapping = {
+            "1m": 1,
+            "2m": 2,
+            "5m": 5,
+            "10m": 10,
+            "15m": 15,
+            "30m": 30,
+            "45m": 45,
+            "1h": 60,
+            "60m": 60,
+            "2h": 120,
+            "4h": 240,
+            "1d": 1440,
+        }
+        return mapping.get(tf, 5)
+
     def _analyze_entry_signal(self, candles: List[Dict[str, float]], current_price: float) -> Dict[str, Any]:
         """
         Build BUY signal from trend + momentum using historical candles.
@@ -986,8 +1169,32 @@ class TradingBot:
         3) Short return positive enough
         4) Recent slope positive enough
         """
-        closes = [float(c.get("close", 0.0)) for c in candles if float(c.get("close", 0.0)) > 0]
-        if len(closes) < max(self.config.entry_slow_ma, 10):
+        normalized: List[Dict[str, float]] = []
+        for candle in candles:
+            close_v = self._to_float(candle.get("close"))
+            open_v = self._to_float(candle.get("open"))
+            high_v = self._to_float(candle.get("high"))
+            low_v = self._to_float(candle.get("low"))
+            if (
+                close_v is None
+                or open_v is None
+                or high_v is None
+                or low_v is None
+                or close_v <= 0
+                or open_v <= 0
+                or high_v <= 0
+                or low_v <= 0
+            ):
+                continue
+            normalized.append({
+                "open": float(open_v),
+                "high": float(high_v),
+                "low": float(low_v),
+                "close": float(close_v),
+            })
+
+        closes = [row["close"] for row in normalized]
+        if len(closes) < max(self.config.entry_slow_ma, 12):
             return {
                 "buy": False,
                 "reason": "Insufficient close samples",
@@ -1013,25 +1220,85 @@ class TradingBot:
         slope_abs = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_vals, slice_closes)) / denominator
         slope_pct = (slope_abs / y_mean) if y_mean > 0 else 0.0
 
+        timeframe_minutes = max(1, self._timeframe_to_minutes(self.config.entry_timeframe))
+        candles_last_hour = max(6, int(round(60 / timeframe_minutes)))
+        recent = normalized[-min(len(normalized), candles_last_hour):]
+
+        half = max(2, len(recent) // 2)
+        first_half = recent[:half]
+        second_half = recent[-half:]
+        first_half_high = max((row["high"] for row in first_half), default=last_close)
+        second_half_high = max((row["high"] for row in second_half), default=last_close)
+        first_half_low = min((row["low"] for row in first_half), default=last_close)
+        second_half_low = min((row["low"] for row in second_half), default=last_close)
+
+        structure_higher_highs = second_half_high >= first_half_high
+        structure_higher_lows = second_half_low >= first_half_low
+        structure_up = structure_higher_highs and structure_higher_lows
+
+        support_line = min((row["low"] for row in recent), default=last_close)
+        resistance_line = max((row["high"] for row in recent), default=last_close)
+        range_size = max(resistance_line - support_line, 0.0)
+        line_tolerance_pct = max(0.0004, abs(float(self.config.entry_min_trend_pct)) * 1.5)
+
+        def _is_touch(value: float, line: float) -> bool:
+            if line <= 0:
+                return False
+            return abs(value - line) / line <= line_tolerance_pct
+
+        touch_window = recent[-min(6, len(recent)):]
+        resistance_touches = sum(1 for row in touch_window if _is_touch(row["high"], resistance_line))
+        support_touches = sum(1 for row in touch_window if _is_touch(row["low"], support_line))
+
+        reaction_window = touch_window[-min(3, len(touch_window)):]
+        bearish_resistance_rejection = any(
+            _is_touch(row["high"], resistance_line) and row["close"] < row["open"]
+            for row in reaction_window
+        )
+        bullish_support_bounce = any(
+            _is_touch(row["low"], support_line) and row["close"] > row["open"]
+            for row in reaction_window
+        )
+
+        distance_from_support = 0.0
+        if range_size > 0:
+            distance_from_support = (current_price - support_line) / range_size
+            distance_from_support = min(max(distance_from_support, 0.0), 1.0)
+
         cond_ma_trend = fast_ma > slow_ma
         cond_price_above_fast = current_price >= fast_ma and last_close >= fast_ma
         cond_short_return = short_return_pct >= float(self.config.entry_min_trend_pct)
         cond_slope = slope_pct >= float(self.config.entry_min_momentum_pct)
+        cond_structure_up = structure_up
+        cond_line_reaction_ok = bullish_support_bounce or (distance_from_support <= 0.75 and not bearish_resistance_rejection)
 
         condition_flags = {
             "ma_trend_up": cond_ma_trend,
             "price_above_fast_ma": cond_price_above_fast,
             "short_return_positive": cond_short_return,
             "slope_positive": cond_slope,
+            "last_hour_structure_up": cond_structure_up,
+            "line_touch_reaction_ok": cond_line_reaction_ok,
         }
         score = sum(1 for value in condition_flags.values() if value)
-        required = max(1, int(self.config.entry_required_signals))
-        buy = score >= required
+        required = max(int(self.config.entry_required_signals), 4)
 
-        reason = (
+        hard_block_reason: Optional[str] = None
+        if bearish_resistance_rejection and distance_from_support >= 0.7:
+            hard_block_reason = "WAIT: bearish rejection at resistance in last hour"
+        elif not structure_up and short_return_pct <= 0:
+            hard_block_reason = "WAIT: last-hour structure is not bullish"
+
+        buy = score >= required
+        if hard_block_reason:
+            buy = False
+
+        reason_core = (
             f"signals {score}/{len(condition_flags)} | "
-            f"fast={fast_ma:.2f} slow={slow_ma:.2f} ret={short_return_pct*100:.3f}% slope={slope_pct*100:.3f}%"
+            f"fast={fast_ma:.2f} slow={slow_ma:.2f} ret={short_return_pct*100:.3f}% slope={slope_pct*100:.3f}% "
+            f"linePos={distance_from_support*100:.1f}% touches(S/R)={support_touches}/{resistance_touches}"
         )
+        reason = f"{hard_block_reason} | {reason_core}" if hard_block_reason else reason_core
 
         return {
             "buy": buy,
@@ -1046,6 +1313,16 @@ class TradingBot:
                 "slow_ma": slow_ma,
                 "short_return_pct": short_return_pct,
                 "slope_pct": slope_pct,
+                "support_line": support_line,
+                "resistance_line": resistance_line,
+                "line_tolerance_pct": line_tolerance_pct,
+                "support_touches": support_touches,
+                "resistance_touches": resistance_touches,
+                "bullish_support_bounce": bullish_support_bounce,
+                "bearish_resistance_rejection": bearish_resistance_rejection,
+                "last_hour_structure_up": structure_up,
+                "line_position_pct": distance_from_support,
+                "candles_last_hour_used": len(recent),
             },
             "samples": len(closes),
         }
@@ -1220,6 +1497,7 @@ class TradingBot:
             'profit_analysis': None,
             'movement_signal': self.last_movement_signal,
             'entry_signal': self.last_entry_signal,
+            'exit_signal': self.last_exit_signal,
             'blocked_by': self.blocked_by,
             'blocked_details': self.blocked_details,
             'last_trigger': {
