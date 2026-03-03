@@ -16,6 +16,12 @@ print("STARTUP: FastAPI app being created")
 app = FastAPI()
 print("STARTUP: FastAPI app created successfully")
 
+
+@app.get("/health")
+async def health_check():
+    """Simple liveness probe – no external dependencies."""
+    return {"status": "ok"}
+
 frontend_origins_env = os.getenv("FRONTEND_ORIGINS", "")
 frontend_origins = [origin.strip() for origin in frontend_origins_env.split(",") if origin.strip()]
 
