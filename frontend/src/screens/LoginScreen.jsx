@@ -19,6 +19,16 @@ function isDeviceUnsafeApiBase(url) {
   return /:\/\/(10\.0\.2\.2|localhost|127\.0\.0\.1)(?::|\/|$)/i.test(value);
 }
 
+function formatErrorDetail(detail) {
+  if (!detail) return '';
+  if (typeof detail === 'string') return detail;
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return '';
+  }
+}
+
 function loadSavedDomain() {
   try {
     const saved = localStorage.getItem(LIQUID_DOMAIN_STORAGE_KEY);
@@ -86,6 +96,7 @@ export default function LoginScreen({ onLoginSuccess }) {
       await liquidAuth.basicLogin(email.trim(), domain || DEFAULT_LIQUID_DOMAIN, password);
     } catch (err) {
       const responseStatus = err?.response?.status;
+      const responseDetail = formatErrorDetail(err?.response?.data?.detail);
       if (!responseStatus) {
         const currentBase = getLiquidApiBase();
         const isEmulatorAlias = String(currentBase).includes('10.0.2.2');
@@ -96,8 +107,11 @@ export default function LoginScreen({ onLoginSuccess }) {
           ? ' Backend start command: python -m uvicorn main:app --host 0.0.0.0 --port 8001 --reload.'
           : '';
         setError(`Cannot connect to server at ${currentBase}. ${extraHint}${devHint}`.trim());
+      } else if (responseStatus === 404) {
+        setError(`Backend API URL is reachable but route is missing (404): ${apiBaseUrl.trim()}. Use a server that exposes /api/trading/auth/basic/login (for local: http://10.100.102.10:8001/api/trading).`);
       } else {
-        setError('Liquid API login failed. Check email/password.');
+        const suffix = responseDetail ? ` (${responseDetail})` : '';
+        setError(`Liquid API login failed. Check email/password or domain.${suffix}`);
       }
       setLoading(false);
       return;
