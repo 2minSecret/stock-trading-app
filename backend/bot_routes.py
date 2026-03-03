@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 import logging
+import os
 
 from bot_manager import bot_manager
 
@@ -61,7 +62,7 @@ async def start_bot(request: BotStartRequest):
             username=request.username,
             password=request.password,
             session_token=request.sessionToken,
-            api_base_url="http://localhost:8001",
+            api_base_url=os.getenv("API_BASE_URL", "http://localhost:8001"),
             custom_config=request.customConfig
         )
         
