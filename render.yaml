@@ -7,7 +7,7 @@ services:
     healthCheckPath: /api/trading
     envVars:
       - key: FRONTEND_ORIGINS
-        value: http://localhost:5173,http://127.0.0.1:5173,capacitor://localhost,ionic://localhost
+        value: http://localhost:5173,http://127.0.0.1:5173,capacitor://localhost,ionic://localhost,https://stock-trading-frontend.onrender.com
       - key: SIMULATE_FEED
         value: "true"
       - key: POLYGON_SYMBOLS
@@ -22,12 +22,11 @@ services:
     autoDeploy: true
     envVars:
       - key: VITE_LIQUID_API_URL
-        fromService:
-          type: web
-          name: stock-trading-backend
-          property: url
+        value: https://stock-trading-backend.onrender.com/api/trading
       - key: VITE_API_BASE_URL
         fromService:
           type: web
           name: stock-trading-backend
           property: url
+      - key: VITE_MARKET_FEED_WS_URL
+        value: wss://stock-trading-backend.onrender.com/ws/stock-data
