@@ -6,10 +6,8 @@ services:
     autoDeploy: true
     healthCheckPath: /api/trading
     envVars:
-      - key: PORT
-        value: "10000"
       - key: FRONTEND_ORIGINS
-        value: http://localhost:5173,http://127.0.0.1:5173,capacitor://localhost,ionic://localhost,https://YOUR-FRONTEND-DOMAIN-HERE
+        value: http://localhost:5173,http://127.0.0.1:5173,capacitor://localhost,ionic://localhost
       - key: SIMULATE_FEED
         value: "true"
       - key: POLYGON_SYMBOLS
