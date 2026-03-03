@@ -6,9 +6,22 @@ Checks that the login flow behaves correctly for:
 - Invalid credentials (upstream returns 401)
 - Missing required fields (FastAPI validation)
 - Network errors reaching the upstream auth service
+- Real-credential integration test (skipped when env vars are absent)
+
+Real-credential integration test usage
+---------------------------------------
+Set the following environment variables before running pytest to exercise the
+live Liquid Charts authentication service:
+
+    LIQUID_TEST_USERNAME=<your email>
+    LIQUID_TEST_PASSWORD=<your password>
+
+Example:
+    LIQUID_TEST_USERNAME=user@example.com LIQUID_TEST_PASSWORD=secret pytest backend/test_login.py::test_login_real_credentials -v
 """
 
 import json
+import os
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -128,3 +141,93 @@ def test_login_network_error():
 
     assert resp.status_code == 400
     assert "Connection refused" in resp.json().get("detail", "")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _extract_session_token(payload: dict):
+    """
+    Return the session token from an upstream login response or None.
+
+    The Liquid Charts API may return the token under several different key
+    names.  This helper mirrors the logic in the frontend's
+    ``extractSessionToken`` function in ``liquidChartsClient.js``.
+    """
+    top_level_keys = (
+        "token", "accessToken", "sessionToken", "sessionID",
+        "sessionId", "sid", "id", "authToken",
+    )
+    return (
+        next((payload[k] for k in top_level_keys if payload.get(k)), None)
+        or payload.get("session", {}).get("token")
+        or payload.get("session", {}).get("id")
+        or payload.get("data", {}).get("token")
+        or payload.get("data", {}).get("sessionToken")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Real-credential integration test
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not os.environ.get("LIQUID_TEST_USERNAME") or not os.environ.get("LIQUID_TEST_PASSWORD"),
+    reason="Set LIQUID_TEST_USERNAME and LIQUID_TEST_PASSWORD env vars to run the live login test",
+)
+def test_login_real_credentials():
+    """
+    Integration test: attempt a real login against the upstream Liquid Charts API.
+
+    Skipped automatically when the required environment variables are absent so
+    the test suite remains safe to run in CI without live credentials.
+
+    Run manually with:
+        LIQUID_TEST_USERNAME=user@example.com \\
+        LIQUID_TEST_PASSWORD=secret \\
+        pytest backend/test_login.py::test_login_real_credentials -v -s
+    """
+    username = os.environ["LIQUID_TEST_USERNAME"]
+    password = os.environ["LIQUID_TEST_PASSWORD"]
+
+    resp = client.post(
+        LOGIN_URL,
+        json={"username": username, "domain": "", "password": password},
+    )
+
+    # A 400 whose detail mentions a hostname / address / connect error means the
+    # upstream is not reachable from this environment (e.g. a sandboxed CI runner
+    # with no internet access).  Skip instead of failing so the test doesn't
+    # produce a misleading red result when the credentials themselves are correct.
+    if resp.status_code == 400:
+        detail = resp.json().get("detail", "")
+        network_indicators = (
+            "No address associated with hostname",
+            "ConnectError",
+            "Connection refused",
+            "Name or service not known",
+            "getaddrinfo failed",
+        )
+        if any(indicator in detail for indicator in network_indicators):
+            pytest.skip(
+                f"Upstream Liquid Charts API is not reachable from this environment "
+                f"(network error: {detail}). Run this test on a machine with internet access."
+            )
+
+    assert resp.status_code == 200, (
+        f"Login failed with status {resp.status_code}. "
+        f"Response body: {resp.text[:500]}"
+    )
+
+    body = resp.json()
+    session_token = _extract_session_token(body)
+
+    assert session_token, (
+        f"Login returned 200 but no session token was found in response body. "
+        f"Full body: {json.dumps(body, indent=2)}"
+    )
+
+    # Avoid printing token values in logs; just confirm a token was received.
+    print(f"\n✅ Login succeeded. Session token received (key count: {len(body)}).")
+
