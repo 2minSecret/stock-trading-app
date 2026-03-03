@@ -12,3 +12,22 @@ services:
         value: "true"
       - key: POLYGON_SYMBOLS
         value: ^IXIC,AAPL,TSLA,MSFT,GOOGL,AMZN,NVDA,META,NFLX
+
+  - type: web
+    name: stock-trading-frontend
+    env: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    autoDeploy: true
+    envVars:
+      - key: VITE_LIQUID_API_URL
+        fromService:
+          type: web
+          name: stock-trading-backend
+          property: url
+      - key: VITE_API_BASE_URL
+        fromService:
+          type: web
+          name: stock-trading-backend
+          property: url
