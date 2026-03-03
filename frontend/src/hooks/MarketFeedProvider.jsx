@@ -8,6 +8,17 @@ function buildWsCandidates(url) {
   const envUrl = import.meta.env.VITE_MARKET_FEED_WS_URL;
   if (envUrl) return [envUrl];
 
+  // Derive WebSocket URL from the configured API base (supports deployed HTTPS backends)
+  const apiBase = import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_LIQUID_API_URL || '';
+  if (apiBase) {
+    const wsUrl = apiBase
+      .replace(/^https:\/\//, 'wss://')
+      .replace(/^http:\/\//, 'ws://')
+      .replace(/\/api\/trading\/?$/, '')
+      .replace(/\/?$/, '') + '/ws/stock-data';
+    return [wsUrl];
+  }
+
   const host = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
   return [
     `ws://${host}:8001/ws/stock-data`,

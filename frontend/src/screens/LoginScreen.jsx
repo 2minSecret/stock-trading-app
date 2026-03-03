@@ -3,6 +3,7 @@ import { getLiquidApiBase, liquidAuth, setLiquidApiBase } from '../services/liqu
 
 const LIQUID_DOMAIN_STORAGE_KEY = 'liquid_api_domain_v1';
 const DEFAULT_LIQUID_DOMAIN = '';
+const DEFAULT_API_URL_PLACEHOLDER = import.meta.env.VITE_LIQUID_API_URL || 'https://stock-trading-backend.onrender.com/api/trading';
 
 function isLikelyAndroidPhoneRuntime() {
   if (typeof window === 'undefined' || typeof navigator === 'undefined') return false;
@@ -89,8 +90,8 @@ export default function LoginScreen({ onLoginSuccess }) {
         const currentBase = getLiquidApiBase();
         const isEmulatorAlias = String(currentBase).includes('10.0.2.2');
         const extraHint = isEmulatorAlias
-          ? 'On a real Android device, use your PC LAN IP (example: http://192.168.1.100:8001/api/trading). 10.0.2.2 works only in emulator.'
-          : 'Ensure phone and backend PC are on the same Wi-Fi network, and use PC LAN IP in Backend API URL.';
+          ? `On a real Android device, use the deployed backend URL (e.g. ${DEFAULT_API_URL_PLACEHOLDER}) or your PC LAN IP. 10.0.2.2 works only in emulator.`
+          : 'Check that the Backend API URL points to the deployed server or that your phone and backend PC are on the same Wi-Fi network.';
         const devHint = import.meta.env.DEV
           ? ' Backend start command: python -m uvicorn main:app --host 0.0.0.0 --port 8001 --reload.'
           : '';
@@ -154,10 +155,10 @@ export default function LoginScreen({ onLoginSuccess }) {
                   type="text"
                   value={apiBaseUrl}
                   onChange={(e) => setApiBaseUrl(e.target.value)}
-                  placeholder="http://10.100.102.10:8001/api/trading"
+                  placeholder={DEFAULT_API_URL_PLACEHOLDER}
                   className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition"
                 />
-                <p className="mt-1 text-[11px] text-gray-500">Android phone: use PC LAN IP (for example, http://192.168.1.100:8001/api/trading). Emulator can use http://10.0.2.2:8001/api/trading.</p>
+                <p className="mt-1 text-[11px] text-gray-500">Use the deployed backend URL (e.g. {DEFAULT_API_URL_PLACEHOLDER}). On a local network, use the PC LAN IP (e.g. http://192.168.1.100:8001/api/trading).</p>
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">Password</label>
