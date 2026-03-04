@@ -27,9 +27,6 @@ services:
     autoDeploy: true
     envVars:
       - key: VITE_API_BASE_URL
-        fromService:
-          type: web
-          name: stock-trading-backend
-          property: url
+        value: https://stock-trading-backend.onrender.com/api/trading
       - key: VITE_MARKET_FEED_WS_URL
         value: wss://stock-trading-backend.onrender.com/ws/stock-data
