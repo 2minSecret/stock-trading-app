@@ -49,6 +49,17 @@
 				"tmp_e2e_buy_sell_check.py"
 			],
 			"isBackground": false
+		},
+		{
+			"label": "login-check-render-local",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$payload = '{\"username\":\"elyasaf2020@gmail.com\",\"domain\":\"default\",\"password\":\"Y4^xTO*2]>\"}'; foreach ($u in @('https://stock-trading-backend.onrender.com/api/trading/auth/basic/login','http://127.0.0.1:8001/api/trading/auth/basic/login')) { try { $r = Invoke-WebRequest -Uri $u -Method Post -Body $payload -ContentType 'application/json' -TimeoutSec 40 -ErrorAction Stop; Write-Output ('LOGIN_CHECK ' + $u + ' => HTTP ' + [int]$r.StatusCode) } catch { if ($_.Exception.Response) { Write-Output ('LOGIN_CHECK ' + $u + ' => HTTP ' + [int]$_.Exception.Response.StatusCode.value__) } else { Write-Output ('LOGIN_CHECK ' + $u + ' => NO_RESPONSE') } } }"
+			],
+			"isBackground": false
 		}
 	]
 }

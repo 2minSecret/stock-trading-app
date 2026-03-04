@@ -16,6 +16,12 @@ function normalizeApiBaseUrl(value) {
   return raw.replace(/\/+$/, '');
 }
 
+function withTradingApiPath(value) {
+  const normalized = normalizeApiBaseUrl(value);
+  if (!normalized) return '';
+  return normalized.endsWith('/api/trading') ? normalized : `${normalized}/api/trading`;
+}
+
 function loadSavedApiBase() {
   try {
     return normalizeApiBaseUrl(localStorage.getItem(API_BASE_STORAGE_KEY) || '');
@@ -61,7 +67,9 @@ function resolveApiBase() {
     }
   }
 
-  const envBase = normalizeApiBaseUrl(import.meta.env.VITE_LIQUID_API_URL || '');
+  const envLiquidBase = normalizeApiBaseUrl(import.meta.env.VITE_LIQUID_API_URL || '');
+  const envServiceBase = withTradingApiPath(import.meta.env.VITE_API_BASE_URL || '');
+  const envBase = envLiquidBase || envServiceBase;
   if (envBase) return envBase;
 
   if (isCapacitorRuntime) {

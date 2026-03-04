@@ -3,7 +3,10 @@ import { getLiquidApiBase, liquidAuth, setLiquidApiBase } from '../services/liqu
 
 const LIQUID_DOMAIN_STORAGE_KEY = 'liquid_api_domain_v1';
 const DEFAULT_LIQUID_DOMAIN = '';
-const DEFAULT_API_URL_PLACEHOLDER = import.meta.env.VITE_LIQUID_API_URL || 'https://stock-trading-backend.onrender.com/api/trading';
+const envServiceBase = String(import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
+const DEFAULT_API_URL_PLACEHOLDER =
+  import.meta.env.VITE_LIQUID_API_URL
+  || (envServiceBase ? `${envServiceBase}/api/trading` : 'https://stock-trading-backend.onrender.com/api/trading');
 
 function isLikelyAndroidPhoneRuntime() {
   if (typeof window === 'undefined' || typeof navigator === 'undefined') return false;

@@ -26,8 +26,6 @@ services:
     staticPublishPath: dist
     autoDeploy: true
     envVars:
-      - key: VITE_LIQUID_API_URL
-        value: https://stock-trading-backend.onrender.com/api/trading
       - key: VITE_API_BASE_URL
         fromService:
           type: web
