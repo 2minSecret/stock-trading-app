@@ -16,6 +16,16 @@ const frontendHost = typeof window !== 'undefined' ? window.location.hostname : 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || `http://${frontendHost}:8001`;
 const BOT_CUSTOM_CONFIG_STORAGE_KEY = 'bot_custom_config_v1';
 
+const normalizeBaseUrl = (value) => String(value || '').trim().replace(/\/+$/, '');
+const withTradingPrefix = (baseUrl, path) => {
+  const normalizedBase = normalizeBaseUrl(baseUrl);
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  if (normalizedBase.endsWith('/api/trading')) {
+    return `${normalizedBase}${normalizedPath}`;
+  }
+  return `${normalizedBase}/api/trading${normalizedPath}`;
+};
+
 const normalizeActiveDays = (days) => {
   if (!Array.isArray(days)) return [1, 2, 3, 4, 5];
 
@@ -127,7 +137,7 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
     
     try {
       if (showLoading) setIsLoading(true);
-      const response = await axios.post(`${API_BASE_URL}/api/trading/bot/status`, {
+      const response = await axios.post(withTradingPrefix(API_BASE_URL, '/bot/status'), {
         accountId: selectedAccount.accountId
       });
       
@@ -180,7 +190,7 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
         // Ignore local storage write errors
       }
 
-      const response = await axios.post(`${API_BASE_URL}/api/trading/bot/start`, {
+      const response = await axios.post(withTradingPrefix(API_BASE_URL, '/bot/start'), {
         accountId: selectedAccount.accountId,
         username: currentUser.credentials?.username,
         password: currentUser.credentials?.password,
@@ -210,7 +220,7 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
       setIsLoading(true);
       setError(null);
 
-      const response = await axios.post(`${API_BASE_URL}/api/trading/bot/stop`, {
+      const response = await axios.post(withTradingPrefix(API_BASE_URL, '/bot/stop'), {
         accountId: selectedAccount.accountId
       });
 
@@ -235,7 +245,7 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
       setIsLoading(true);
       setError(null);
 
-      const response = await axios.post(`${API_BASE_URL}/api/trading/bot/force-stop`, {
+      const response = await axios.post(withTradingPrefix(API_BASE_URL, '/bot/force-stop'), {
         accountId: selectedAccount.accountId
       });
 
