@@ -24,6 +24,9 @@ async def health_check():
 
 frontend_origins_env = os.getenv("FRONTEND_ORIGINS", "")
 frontend_origins = [origin.strip() for origin in frontend_origins_env.split(",") if origin.strip()]
+# Always allow Render frontend URL for CORS
+if "https://stock-trading-frontend-g07o.onrender.com" not in frontend_origins:
+    frontend_origins.append("https://stock-trading-frontend-g07o.onrender.com")
 
 # Allow React front-end to communicate with this back-end
 app.add_middleware(
