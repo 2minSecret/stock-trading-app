@@ -323,14 +323,13 @@ class TradingBot:
                     await asyncio.sleep(self.config.check_interval)
                     continue
 
-                # Inside trading window
+                # Inside trading window: immediately buy/sell using quick_trade_decision
                 if self.current_position is None:
-                    # No position - look for entry
                     self.state = BotState.MONITORING_ENTRY
-                    self._set_blocked("evaluating_entry")
-                    await self._try_enter_position()
+                    self._set_blocked("quick_trade_decision")
+                    logger.info("⚡ Immediate quick trade decision on bot activation")
+                    await self.quick_trade_decision()
                 else:
-                    # Have position - monitor for exit
                     self.state = BotState.IN_POSITION
                     self._set_blocked(None)
                     await self._monitor_position()
