@@ -53,7 +53,7 @@ class TradingConfig:
     entry_slow_ma: int = 21
     entry_min_trend_pct: float = 0.0001  # 0.01%
     entry_min_momentum_pct: float = 0.00005  # 0.005%
-    entry_required_signals: int = 3
+    entry_required_signals: int = 1
 
     def __post_init__(self):
         if self.active_days is None:
@@ -1281,7 +1281,7 @@ class TradingBot:
             "line_touch_reaction_ok": cond_line_reaction_ok,
         }
         score = sum(1 for value in condition_flags.values() if value)
-        required = max(int(self.config.entry_required_signals), 4)
+        required = max(int(self.config.entry_required_signals), 1)
 
         hard_block_reason: Optional[str] = None
         if bearish_resistance_rejection and distance_from_support >= 0.7:

@@ -599,8 +599,8 @@ class LiquidChartsAPI:
                 # Bearer auth fallback
                 headers = {"Authorization": f"Bearer {token}"} if token else {}
 
+            # Use dxsca-web accounts order endpoint for account-specific orders
             order_urls = [
-                f"{LIQUID_ORDER_BASE}/dxsca-fxblue/accounts/{account_code}/orders",
                 f"{LIQUID_METRICS_BASE}/dxsca-web/accounts/{account_code}/orders",
             ]
 
