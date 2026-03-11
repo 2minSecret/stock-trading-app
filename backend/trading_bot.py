@@ -61,17 +61,54 @@ class TradingConfig:
 
 
 class TradingBot:
-    """
-    Automated NAS100 Trading Bot with Smart Profit Management.
-    
-    Features:
-    - Trades only during specified time window (09:25-10:00)
-    - Automatic stop-loss at 20% ($20)
-    - Smart profit exit: waits 1-3 min, exits on 2% decline from peak
-    - 32-minute cooldown after each exit
-    - Real-time position monitoring every 5 seconds
-    """
-    
+        async def quick_trade_decision(self):
+            """
+            Evaluate chart bar quickly and enter buy/sell. Close after 30 seconds.
+            """
+            price_data = await self._get_market_price()
+            if not price_data:
+                logger.info("No price data for quick trade.")
+                return
+            current_price = price_data.get('bid', 0)
+            candles = await self._get_market_candles(
+                timeframe=self.config.entry_timeframe,
+                limit=3,
+            )
+            if not candles or len(candles) < 3:
+                logger.info("Not enough candles for quick trade.")
+                return
+            last_bar = candles[-1]
+            prev_bar = candles[-2]
+            # Simple logic: if last bar is positive and going up, buy; if negative and going down, sell
+            bar_change = last_bar['close'] - last_bar['open']
+            trend = last_bar['close'] - prev_bar['close']
+            if bar_change > 0 and trend > 0:
+                action = 'buy'
+            elif bar_change < 0 and trend < 0:
+                action = 'sell'
+            else:
+                logger.info("No clear quick trade signal.")
+                return
+            logger.info(f"QUICK TRADE: {action.upper()} @ {current_price}")
+            order_result = await self._place_order(
+                symbol=self.config.symbol,
+                side=action,
+                quantity=1,
+                amount=self.config.purchase_amount
+            )
+            if order_result and order_result.get('success'):
+                self.current_position = order_result
+                self.entry_price = current_price
+                self.position_id = order_result.get('orderId') or order_result.get('id')
+                self.position_code = self._extract_position_code_from_result(order_result)
+                self.entry_side = action.upper()
+                self.entry_quantity = 1.0
+                logger.info(f"QUICK TRADE OPENED: {self.position_id}")
+                await asyncio.sleep(30)
+                await self._close_position("Quick trade timed close")
+            else:
+                logger.error(f"QUICK TRADE FAILED: {order_result}")
+class TradingBot:
     def __init__(
         self,
         account_id: str,
@@ -99,21 +136,21 @@ class TradingBot:
         # Bot state
         self.state = BotState.IDLE
         self.is_running = False
-        self.task: Optional[asyncio.Task] = None
+        self.task = None
         
         # Position tracking
-        self.current_position: Optional[Dict[str, Any]] = None
-        self.entry_price: Optional[float] = None
-        self.position_id: Optional[str] = None
-        self.position_code: Optional[str] = None
-        self.entry_side: str = "BUY"
-        self.entry_quantity: float = 1.0
-        self.stop_loss_price: Optional[float] = None
-        self.take_profit_price: Optional[float] = None
-        self.close_order_inflight: bool = False
-        self.last_observed_price: Optional[float] = None
-        self.last_trigger_type: Optional[str] = None
-        self.last_trigger_at: Optional[str] = None
+        self.current_position = None
+        self.entry_price = None
+        self.position_id = None
+        self.position_code = None
+        self.entry_side = "BUY"
+        self.entry_quantity = 1.0
+        self.stop_loss_price = None
+        self.take_profit_price = None
+        self.close_order_inflight = False
+        self.last_observed_price = None
+        self.last_trigger_type = None
+        self.last_trigger_at = None
         
         # Profit analyzer
         self.profit_analyzer = ProfitAnalyzer(
@@ -123,18 +160,18 @@ class TradingBot:
         )
 
         # Auth/session for market data endpoints
-        self.session_token: Optional[str] = self._extract_token_from_payload(self.auth)
+        self.session_token = self._extract_token_from_payload(self.auth)
         
         # Cooldown tracking
-        self.cooldown_until: Optional[datetime] = None
-        self.last_movement_check_at: Optional[datetime] = None
-        self.last_movement_signal: Optional[Dict[str, Any]] = None
-        self.last_entry_signal: Optional[Dict[str, Any]] = None
-        self.last_exit_signal: Optional[Dict[str, Any]] = None
-        self.blocked_by: Optional[str] = None
-        self.blocked_details: Optional[Dict[str, Any]] = None
-        self.cached_quote: Optional[Dict[str, Any]] = None
-        self.cached_candles: Optional[List[Dict[str, float]]] = None
+        self.cooldown_until = None
+        self.last_movement_check_at = None
+        self.last_movement_signal = None
+        self.last_entry_signal = None
+        self.last_exit_signal = None
+        self.blocked_by = None
+        self.blocked_details = None
+        self.cached_quote = None
+        self.cached_candles = None
         
         # Statistics
         self.stats = {
