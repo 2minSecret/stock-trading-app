@@ -45,7 +45,12 @@ function loadSavedDomain() {
 export default function LoginScreen({ onLoginSuccess }) {
   const [email, setEmail] = useState('');
   const [domain, setDomain] = useState(() => loadSavedDomain());
-  const [apiBaseUrl, setApiBaseUrl] = useState(() => getLiquidApiBase());
+  // Always use Render backend URL unless already set
+  const RENDER_API_URL = 'https://stock-trading-backend-u6lk.onrender.com/api/trading';
+  const [apiBaseUrl, setApiBaseUrl] = useState(() => {
+    const current = getLiquidApiBase();
+    return current && current !== '' ? current : RENDER_API_URL;
+  });
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -166,16 +171,9 @@ export default function LoginScreen({ onLoginSuccess }) {
                   className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition"
                 />
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">Backend API URL</label>
-                <input
-                  type="text"
-                  value={apiBaseUrl}
-                  onChange={(e) => setApiBaseUrl(e.target.value)}
-                  placeholder={DEFAULT_API_URL_PLACEHOLDER}
-                  className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition"
-                />
-                <p className="mt-1 text-[11px] text-gray-500">Use the deployed backend URL (e.g. {DEFAULT_API_URL_PLACEHOLDER}). On a local network, use the PC LAN IP (e.g. http://192.168.1.100:8001/api/trading).</p>
+              {/* Hide Backend API URL input, always use Render backend */}
+              <div style={{ display: 'none' }}>
+                <input type="text" value={apiBaseUrl} readOnly />
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">Password</label>
