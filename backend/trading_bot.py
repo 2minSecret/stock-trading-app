@@ -20,55 +20,6 @@ from profit_analyzer import ProfitAnalyzer
 logger = logging.getLogger(__name__)
 
 
-async def quick_trade_decision(self):
-        """
-        Evaluate chart bar quickly and enter buy/sell. Close after 30 seconds.
-        """
-        price_data = await self._get_market_price()
-        if not price_data:
-            logger.info("No price data for quick trade.")
-            return
-        current_price = price_data.get('bid', 0)
-        candles = await self._get_market_candles(
-            timeframe=self.config.entry_timeframe,
-            limit=3,
-        )
-        if not candles or len(candles) < 3:
-            logger.info("Not enough candles for quick trade.")
-            return
-        last_bar = candles[-1]
-        prev_bar = candles[-2]
-        # Simple logic: if last bar is positive and going up, buy; if negative and going down, sell
-        bar_change = last_bar['close'] - last_bar['open']
-        trend = last_bar['close'] - prev_bar['close']
-        if bar_change > 0 and trend > 0:
-            action = 'buy'
-        elif bar_change < 0 and trend < 0:
-            action = 'sell'
-        else:
-            logger.info("No clear quick trade signal.")
-            return
-        logger.info(f"QUICK TRADE: {action.upper()} @ {current_price}")
-        order_result = await self._place_order(
-            symbol=self.config.symbol,
-            side=action,
-            quantity=1,
-            amount=self.config.purchase_amount
-        )
-        if order_result and order_result.get('success'):
-            self.current_position = order_result
-            self.entry_price = current_price
-            self.position_id = order_result.get('orderId') or order_result.get('id')
-            self.position_code = self._extract_position_code_from_result(order_result)
-            self.entry_side = action.upper()
-            self.entry_quantity = 1.0
-            logger.info(f"QUICK TRADE OPENED: {self.position_id}")
-            await asyncio.sleep(30)
-            await self._close_position("Quick trade timed close")
-        else:
-            logger.error(f"QUICK TRADE FAILED: {order_result}")
-
-
 class BotState(str, Enum):
     IDLE = "idle"
     WAITING_FOR_WINDOW = "waiting_for_window"
@@ -102,6 +53,7 @@ class TradingConfig:
     entry_slow_ma: int = 21
     entry_min_trend_pct: float = 0.0001  # 0.01%
     entry_min_momentum_pct: float = 0.00005  # 0.005%
+    entry_required_signals: int = 3
     entry_required_signals: int = 1
 
     def __post_init__(self):
@@ -110,6 +62,17 @@ class TradingConfig:
 
 
 class TradingBot:
+    """
+    Automated NAS100 Trading Bot with Smart Profit Management.
+    
+    Features:
+    - Trades only during specified time window (09:25-10:00)
+    - Automatic stop-loss at 20% ($20)
+    - Smart profit exit: waits 1-3 min, exits on 2% decline from peak
+    - 32-minute cooldown after each exit
+    - Real-time position monitoring every 5 seconds
+    """
+
     def __init__(
         self,
         account_id: str,
@@ -133,12 +96,12 @@ class TradingBot:
 
         # Timezone handling (client/device timezone preferred, local machine fallback)
         self.runtime_tz, self.runtime_tz_name = self._resolve_timezone(self.config.timezone)
-        
+
         # Bot state
         self.state = BotState.IDLE
         self.is_running = False
-        self.task = None
-        
+        self.task: Optional[asyncio.Task] = None
+
         # Position tracking
         self.current_position: Optional[Dict[str, Any]] = None
         self.entry_price: Optional[float] = None
@@ -152,7 +115,7 @@ class TradingBot:
         self.last_observed_price: Optional[float] = None
         self.last_trigger_type: Optional[str] = None
         self.last_trigger_at: Optional[str] = None
-        
+
         # Profit analyzer
         self.profit_analyzer = ProfitAnalyzer(
             patience_min=self.config.profit_patience_min,
@@ -162,7 +125,7 @@ class TradingBot:
 
         # Auth/session for market data endpoints
         self.session_token: Optional[str] = self._extract_token_from_payload(self.auth)
-        
+
         # Cooldown tracking
         self.cooldown_until: Optional[datetime] = None
         self.last_movement_check_at: Optional[datetime] = None
@@ -173,7 +136,7 @@ class TradingBot:
         self.blocked_details: Optional[Dict[str, Any]] = None
         self.cached_quote: Optional[Dict[str, Any]] = None
         self.cached_candles: Optional[List[Dict[str, float]]] = None
-        
+
         # Statistics
         self.stats = {
             'trades_executed': 0,
@@ -183,7 +146,7 @@ class TradingBot:
             'last_trade_at': None,
             'started_at': None
         }
-        
+
         # HTTP client
         self.client = httpx.AsyncClient(timeout=30.0)
 
@@ -222,7 +185,39 @@ class TradingBot:
             return start <= current_time <= end
 
         return current_time >= start or current_time <= end
-        
+		
+    async def quick_trade_decision(self):
+        """Evaluate chart bar quickly and enter buy/sell. Close after 30 seconds."""
+        price_data = await self._get_market_price()
+        if not price_data:
+            logger.info("No price data for quick trade.")
+            return
+        current_price = price_data.get('bid', 0)
+        candles = await self._get_market_candles(
+            timeframe=self.config.entry_timeframe,
+            limit=3,
+        )
+        if not candles or len(candles) < 3:
+            logger.info("Not enough candles for quick trade.")
+            return
+        last_bar = candles[-1]
+        prev_bar = candles[-2]
+        # Example logic: Buy if last bar is positive and rising, Sell if negative and falling
+        if last_bar['close'] > last_bar['open'] and last_bar['close'] > prev_bar['close']:
+            logger.info("Quick trade: BUY triggered.")
+            await self._place_order(side="buy", price=current_price)
+            await asyncio.sleep(30)
+            logger.info("Quick trade: Closing BUY after 30 seconds.")
+            await self._close_position()
+        elif last_bar['close'] < last_bar['open'] and last_bar['close'] < prev_bar['close']:
+            logger.info("Quick trade: SELL triggered.")
+            await self._place_order(side="sell", price=current_price)
+            await asyncio.sleep(30)
+            logger.info("Quick trade: Closing SELL after 30 seconds.")
+            await self._close_position()
+        else:
+            logger.info("Quick trade: No action taken.")
+
     async def start(self):
         """Start the trading bot"""
         if self.is_running:
@@ -239,7 +234,6 @@ class TradingBot:
                     "reason": "Startup preflight failed: market quote unavailable (session unauthorized or marketdata blocked)",
                 }
                 logger.error("❌ Bot start preflight failed: cannot access market quote")
-                logger.error(f"DETAILS: account_id={self.account_id}, session_token={self.session_token}, config={self.config}")
                 return False
         except Exception as e:
             self._set_blocked("startup_exception", {"error": str(e)})
@@ -248,9 +242,8 @@ class TradingBot:
                 "reason": f"Startup preflight failed: {e}",
             }
             logger.error(f"❌ Bot start preflight exception: {e}")
-            logger.error(f"DETAILS: account_id={self.account_id}, session_token={self.session_token}, config={self.config}")
             return False
-        
+
         logger.info(f"🚀 Starting NAS100 Trading Bot")
         logger.info(f"   Symbol: {self.config.symbol}")
         logger.info(f"   Window: {self.config.trade_window_start} - {self.config.trade_window_end}")
@@ -263,34 +256,34 @@ class TradingBot:
             f"   Entry Signal: tf={self.config.entry_timeframe}, candles={self.config.entry_candles_limit}, "
             f"MA({self.config.entry_fast_ma}/{self.config.entry_slow_ma}), required={self.config.entry_required_signals}"
         )
-        
+
         self.is_running = True
         self.stats['started_at'] = self._now().isoformat()
         self.state = BotState.WAITING_FOR_WINDOW
-        
+
         # Start main loop in background task
         self.task = asyncio.create_task(self._main_loop())
         return True
-    
+
     async def stop(self):
         """Stop the trading bot gracefully"""
         logger.info("🛑 Stopping Trading Bot...")
         self.is_running = False
         self.state = BotState.STOPPED
-        
+
         if self.task:
             self.task.cancel()
             try:
                 await self.task
             except asyncio.CancelledError:
                 pass
-        
+
         # Close any open positions
         if self.current_position and self.position_id:
             await self._close_position("Bot stopped by user")
-        
+
         logger.info("✅ Trading Bot stopped")
-        
+
     async def _main_loop(self):
         """Main trading loop"""
         try:
@@ -309,7 +302,7 @@ class TradingBot:
                     logger.debug(f"📅 Inactive day {weekday}; bot waiting for active days {self.config.active_days}")
                     await asyncio.sleep(self.config.check_interval)
                     continue
-                
+
                 # Check if in cooldown
                 if self.cooldown_until and now < self.cooldown_until:
                     self.state = BotState.COOLDOWN
@@ -318,7 +311,7 @@ class TradingBot:
                     logger.debug(f"💤 Cooldown: {remaining:.0f}s remaining")
                     await asyncio.sleep(self.config.check_interval)
                     continue
-                
+
                 # Check trading window
                 if not self._is_within_trading_window(current_time):
                     self._set_blocked("outside_trading_window", {
@@ -329,7 +322,7 @@ class TradingBot:
                     logger.debug(f"⏰ Outside trading window (current: {current_time.strftime('%H:%M:%S')})")
                     await asyncio.sleep(self.config.check_interval)
                     continue
-                
+
                 # Inside trading window
                 if self.current_position is None:
                     # No position - look for entry
@@ -341,9 +334,9 @@ class TradingBot:
                     self.state = BotState.IN_POSITION
                     self._set_blocked(None)
                     await self._monitor_position()
-                
+
                 await asyncio.sleep(self.config.check_interval)
-                
+
         except asyncio.CancelledError:
             logger.info("Bot task cancelled")
             raise
@@ -351,12 +344,12 @@ class TradingBot:
             logger.error(f"❌ Bot error: {e}", exc_info=True)
             self.state = BotState.STOPPED
             self.is_running = False
-    
+
     async def _try_enter_position(self):
         """Attempt to enter a new position"""
         try:
             logger.info(f"📊 Checking entry conditions for {self.config.symbol}...")
-            
+
             # Get current market price
             price_data = await self._get_market_price()
             if not price_data:
@@ -367,7 +360,7 @@ class TradingBot:
                 }
                 logger.warning("⚠️ Could not fetch market price")
                 return
-            
+
             current_price = price_data.get('bid', 0)
             if current_price <= 0:
                 self._set_blocked("invalid_market_price", {"price": current_price})
@@ -406,7 +399,7 @@ class TradingBot:
                 })
                 logger.info(f"✋ HOLD entry: {entry_signal.get('reason')}")
                 return
-            
+
             # Place buy order
             logger.info(f"🟢 ENTERING POSITION: {self.config.symbol} @ ${current_price:.2f}")
             order_result = await self._place_order(
@@ -415,7 +408,7 @@ class TradingBot:
                 quantity=1,  # 1 contract
                 amount=self.config.purchase_amount
             )
-            
+
             if order_result and order_result.get('success'):
                 self._set_blocked(None)
                 self.current_position = order_result
@@ -430,16 +423,16 @@ class TradingBot:
                 )
                 self.close_order_inflight = False
                 self.last_observed_price = current_price
-                
+
                 # Reset profit analyzer
                 self.profit_analyzer.reset()
                 self.last_movement_check_at = None
                 self.last_movement_signal = None
                 self.last_exit_signal = None
-                
+
                 self.stats['trades_executed'] += 1
                 self.stats['last_trade_at'] = self._now().isoformat()
-                
+
                 logger.info(
                     f"✅ Position opened: {self.position_id} | positionCode={self.position_code or 'n/a'} | "
                     f"SL={self.stop_loss_price:.2f} TP={self.take_profit_price:.2f}"
@@ -451,11 +444,11 @@ class TradingBot:
                     "reason": f"Order placement failed: {order_result}",
                 }
                 logger.error(f"❌ Failed to enter position: {order_result}")
-        
+
         except Exception as e:
             self._set_blocked("entry_exception", {"error": str(e)})
             logger.error(f"❌ Error entering position: {e}", exc_info=True)
-    
+
     async def _monitor_position(self):
         """Monitor existing position and decide when to exit"""
         try:
@@ -464,7 +457,7 @@ class TradingBot:
             if not price_data:
                 logger.warning("⚠️ Could not fetch market price for monitoring")
                 return
-            
+
             current_price = price_data.get('ask', 0)  # Ask price for selling
             if current_price <= 0:
                 return
@@ -501,7 +494,7 @@ class TradingBot:
                     self.stats['losses'] += 1
                 self.stats['total_profit'] += realized_profit
                 return
-            
+
             # Calculate profit/loss
             profit = current_price - self.entry_price
             profit_pct = (profit / self.entry_price) * 100
@@ -523,9 +516,9 @@ class TradingBot:
                     self.stats['losses'] += 1
                 self.stats['total_profit'] += profit
                 return
-            
+
             logger.debug(f"📊 Position P/L: ${profit:.2f} ({profit_pct:.2f}%)")
-            
+
             # Check stop-loss (20% = $20 loss)
             stop_loss_amount = self.config.purchase_amount * self.config.stop_loss_pct
             if profit <= -stop_loss_amount:
@@ -534,7 +527,7 @@ class TradingBot:
                 self.stats['losses'] += 1
                 self.stats['total_profit'] += profit
                 return
-            
+
             # Analyze profit with smart exit logic
             analysis = self.profit_analyzer.record_profit(profit, current_price)
 
@@ -566,7 +559,7 @@ class TradingBot:
                             self.stats['losses'] += 1
                         self.stats['total_profit'] += profit
                         return
-            
+
             # Decision logic
             if analysis['action'] in ['SELL_IMMEDIATE', 'SELL_TIMEOUT']:
                 if exit_signal.get("prefer_hold"):
@@ -577,19 +570,19 @@ class TradingBot:
                 else:
                     logger.info(f"💰 EXIT SIGNAL: {analysis['reason']}")
                     await self._close_position(analysis['reason'])
-                    
+
                     if profit > 0:
                         self.stats['wins'] += 1
                     else:
                         self.stats['losses'] += 1
-                        
+
                     self.stats['total_profit'] += profit
             else:
                 logger.debug(f"✋ HOLD: {analysis['reason']}")
-        
+
         except Exception as e:
             logger.error(f"❌ Error monitoring position: {e}", exc_info=True)
-    
+
     async def _close_position(self, reason: str, trigger_type: Optional[str] = None):
         """Close current position"""
         try:
@@ -601,9 +594,9 @@ class TradingBot:
                 return
 
             self.close_order_inflight = True
-            
+
             logger.info(f"🔴 CLOSING POSITION: {reason}")
-            
+
             close_side = "sell" if self.entry_side == "BUY" else "buy"
             position_effect = "CLOSE" if self.position_code else "OPEN"
             if not self.position_code:
@@ -618,7 +611,7 @@ class TradingBot:
                 position_effect=position_effect,
                 position_code=self.position_code,
             )
-            
+
             if close_result and close_result.get('success'):
                 logger.info(f"✅ Position closed successfully")
                 if trigger_type in ("take_profit", "stop_loss"):
@@ -626,7 +619,7 @@ class TradingBot:
                     self.last_trigger_at = self._now().isoformat()
             else:
                 logger.error(f"❌ Failed to close position: {close_result}")
-            
+
             # Clear position state
             self.current_position = None
             self.entry_price = None
@@ -636,11 +629,11 @@ class TradingBot:
             self.take_profit_price = None
             self.last_observed_price = None
             self.last_exit_signal = None
-            
+
             # Start cooldown
             self.cooldown_until = self._now() + timedelta(minutes=self.config.cooldown_minutes)
             logger.info(f"💤 Entering {self.config.cooldown_minutes}-minute cooldown until {self.cooldown_until.strftime('%H:%M:%S')}")
-            
+
         except Exception as e:
             logger.error(f"❌ Error closing position: {e}", exc_info=True)
         finally:
@@ -982,7 +975,7 @@ class TradingBot:
         if not parsed:
             return None
         return parsed[-int(limit):] if int(limit) > 0 else parsed
-    
+
     async def _get_market_price(self) -> Optional[Dict[str, Any]]:
         """Fetch current market price from API"""
         try:
@@ -1041,9 +1034,9 @@ class TradingBot:
             if self.cached_quote:
                 logger.warning("⚠️ Using cached quote because live quote sources are unavailable")
                 return self.cached_quote
-            
+
             return None
-            
+
         except Exception as e:
             logger.error(f"❌ Error fetching market price: {e}")
             return None
@@ -1215,44 +1208,201 @@ class TradingBot:
             open_v = self._to_float(candle.get("open"))
             high_v = self._to_float(candle.get("high"))
             low_v = self._to_float(candle.get("low"))
-            # FORCED BUY SIGNAL FOR TESTING
+            if (
+                close_v is None
+                or open_v is None
+                or high_v is None
+                or low_v is None
+                or close_v <= 0
+                or open_v <= 0
+                or high_v <= 0
+                or low_v <= 0
+            ):
+                continue
+            normalized.append({
+                "open": float(open_v),
+                "high": float(high_v),
+                "low": float(low_v),
+                "close": float(close_v),
+            })
+
+        closes = [row["close"] for row in normalized]
+        if len(closes) < max(self.config.entry_slow_ma, 12):
             return {
-                "buy": True,
-                "reason": "FORCED: test mode - always buy",
-                "score": 6,
-                "required": 1,
-                "signals": {
-                    "ma_trend_up": True,
-                    "price_above_fast_ma": True,
-                    "short_return_positive": True,
-                    "slope_positive": True,
-                    "last_hour_structure_up": True,
-                    "line_touch_reaction_ok": True,
-                },
-                "metrics": {
-                    "current_price": current_price,
-                    "last_close": current_price,
-                    "fast_ma": current_price,
-                    "slow_ma": current_price,
-                    "short_return_pct": 0.01,
-                    "slope_pct": 0.01,
-                    "support_line": current_price,
-                    "resistance_line": current_price,
-                    "line_tolerance_pct": 0.01,
-                    "support_touches": 1,
-                    "resistance_touches": 1,
-                    "bullish_support_bounce": True,
-                    "bearish_resistance_rejection": False,
-                    "last_hour_structure_up": True,
-                    "line_position_pct": 0.5,
-                    "candles_last_hour_used": 6,
-                },
-                "samples": 12,
+                "buy": False,
+                "reason": "Insufficient close samples",
+                "samples": len(closes),
             }
-        # Minimal patch: remove force_refresh logic and await usage from sync function
-        # If token refresh is needed, it should be handled in async context only
-        # This block is not valid in sync function, so just skip it for now
-        pass
+
+        fast_n = max(2, int(self.config.entry_fast_ma))
+        slow_n = max(fast_n + 1, int(self.config.entry_slow_ma))
+        fast_ma = sum(closes[-fast_n:]) / fast_n
+        slow_ma = sum(closes[-slow_n:]) / slow_n
+        last_close = closes[-1]
+
+        momentum_window = min(8, len(closes) - 1)
+        base_close = closes[-1 - momentum_window]
+        short_return_pct = ((last_close - base_close) / base_close) if base_close > 0 else 0.0
+
+        slope_window = min(slow_n, len(closes))
+        slice_closes = closes[-slope_window:]
+        x_vals = list(range(len(slice_closes)))
+        x_mean = sum(x_vals) / len(x_vals)
+        y_mean = sum(slice_closes) / len(slice_closes)
+        denominator = sum((x - x_mean) ** 2 for x in x_vals) or 1.0
+        slope_abs = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_vals, slice_closes)) / denominator
+        slope_pct = (slope_abs / y_mean) if y_mean > 0 else 0.0
+
+        timeframe_minutes = max(1, self._timeframe_to_minutes(self.config.entry_timeframe))
+        candles_last_hour = max(6, int(round(60 / timeframe_minutes)))
+        recent = normalized[-min(len(normalized), candles_last_hour):]
+
+        half = max(2, len(recent) // 2)
+        first_half = recent[:half]
+        second_half = recent[-half:]
+        first_half_high = max((row["high"] for row in first_half), default=last_close)
+        second_half_high = max((row["high"] for row in second_half), default=last_close)
+        first_half_low = min((row["low"] for row in first_half), default=last_close)
+        second_half_low = min((row["low"] for row in second_half), default=last_close)
+
+        structure_higher_highs = second_half_high >= first_half_high
+        structure_higher_lows = second_half_low >= first_half_low
+        structure_up = structure_higher_highs and structure_higher_lows
+
+        support_line = min((row["low"] for row in recent), default=last_close)
+        resistance_line = max((row["high"] for row in recent), default=last_close)
+        range_size = max(resistance_line - support_line, 0.0)
+        line_tolerance_pct = max(0.0004, abs(float(self.config.entry_min_trend_pct)) * 1.5)
+
+        def _is_touch(value: float, line: float) -> bool:
+            if line <= 0:
+                return False
+            return abs(value - line) / line <= line_tolerance_pct
+
+        touch_window = recent[-min(6, len(recent)):]
+        resistance_touches = sum(1 for row in touch_window if _is_touch(row["high"], resistance_line))
+        support_touches = sum(1 for row in touch_window if _is_touch(row["low"], support_line))
+
+        reaction_window = touch_window[-min(3, len(touch_window)):]
+        bearish_resistance_rejection = any(
+            _is_touch(row["high"], resistance_line) and row["close"] < row["open"]
+            for row in reaction_window
+        )
+        bullish_support_bounce = any(
+            _is_touch(row["low"], support_line) and row["close"] > row["open"]
+            for row in reaction_window
+        )
+
+        distance_from_support = 0.0
+        if range_size > 0:
+            distance_from_support = (current_price - support_line) / range_size
+            distance_from_support = min(max(distance_from_support, 0.0), 1.0)
+
+        cond_ma_trend = fast_ma > slow_ma
+        cond_price_above_fast = current_price >= fast_ma and last_close >= fast_ma
+        cond_short_return = short_return_pct >= float(self.config.entry_min_trend_pct)
+        cond_slope = slope_pct >= float(self.config.entry_min_momentum_pct)
+        cond_structure_up = structure_up
+        cond_line_reaction_ok = bullish_support_bounce or (distance_from_support <= 0.75 and not bearish_resistance_rejection)
+
+        condition_flags = {
+            "ma_trend_up": cond_ma_trend,
+            "price_above_fast_ma": cond_price_above_fast,
+            "short_return_positive": cond_short_return,
+            "slope_positive": cond_slope,
+            "last_hour_structure_up": cond_structure_up,
+            "line_touch_reaction_ok": cond_line_reaction_ok,
+        }
+        score = sum(1 for value in condition_flags.values() if value)
+        required = max(int(self.config.entry_required_signals), 4)
+        required = max(int(self.config.entry_required_signals), 1)
+
+        hard_block_reason: Optional[str] = None
+        if bearish_resistance_rejection and distance_from_support >= 0.7:
+            hard_block_reason = "WAIT: bearish rejection at resistance in last hour"
+        elif not structure_up and short_return_pct <= 0:
+            hard_block_reason = "WAIT: last-hour structure is not bullish"
+
+        buy = score >= required
+        if hard_block_reason:
+            buy = False
+
+        reason_core = (
+            f"signals {score}/{len(condition_flags)} | "
+            f"fast={fast_ma:.2f} slow={slow_ma:.2f} ret={short_return_pct*100:.3f}% slope={slope_pct*100:.3f}% "
+            f"linePos={distance_from_support*100:.1f}% touches(S/R)={support_touches}/{resistance_touches}"
+        )
+        reason = f"{hard_block_reason} | {reason_core}" if hard_block_reason else reason_core
+
+        return {
+            "buy": buy,
+            "reason": reason,
+            "score": score,
+            "required": required,
+            "signals": condition_flags,
+            "metrics": {
+                "current_price": current_price,
+                "last_close": last_close,
+                "fast_ma": fast_ma,
+                "slow_ma": slow_ma,
+                "short_return_pct": short_return_pct,
+                "slope_pct": slope_pct,
+                "support_line": support_line,
+                "resistance_line": resistance_line,
+                "line_tolerance_pct": line_tolerance_pct,
+                "support_touches": support_touches,
+                "resistance_touches": resistance_touches,
+                "bullish_support_bounce": bullish_support_bounce,
+                "bearish_resistance_rejection": bearish_resistance_rejection,
+                "last_hour_structure_up": structure_up,
+                "line_position_pct": distance_from_support,
+                "candles_last_hour_used": len(recent),
+            },
+            "samples": len(closes),
+        }
+
+    async def _ensure_session_token(self):
+        """Ensure bot has a valid basic-auth session token for market data endpoints."""
+        await self._ensure_session_token_internal(force_refresh=False)
+
+    async def _ensure_session_token_internal(self, force_refresh: bool):
+        if self.session_token and not force_refresh:
+            return
+
+        existing = self._extract_token_from_payload(self.auth)
+        if existing and not force_refresh:
+            self.session_token = existing
+            return
+
+        if force_refresh:
+            self.auth.pop('session_token', None)
+            self.auth.pop('sessionToken', None)
+            self.auth.pop('token', None)
+            self.auth.pop('accessToken', None)
+
+        username = self.auth.get('username')
+        password = self.auth.get('password')
+        if not username or not password:
+            raise ValueError("Missing credentials for token refresh: provide username/password or a valid session token")
+
+        response = await self.client.post(
+            f"{self.api_base_url}/api/trading/auth/basic/login",
+            json={
+                "username": username,
+                "domain": self.auth.get('domain', ''),
+                "password": password,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        token = self._extract_token_from_payload(data)
+        if not token:
+            raise ValueError("No session token received from basic login")
+
+        self.session_token = token
+        self.auth['session_token'] = token
+        self.auth['token'] = token
 
     def _extract_token_from_payload(self, payload: Dict[str, Any]) -> Optional[str]:
         if not isinstance(payload, dict):
@@ -1279,7 +1429,7 @@ class TradingBot:
         self.auth.pop('sessionToken', None)
         self.auth.pop('token', None)
         self.auth.pop('accessToken', None)
-    
+
     async def _place_order(
         self,
         symbol: str,
@@ -1346,11 +1496,11 @@ class TradingBot:
                 "orderId": order_id,
                 "data": result,
             }
-            
+
         except Exception as e:
             logger.error(f"❌ Error placing order: {e}")
             return None
-    
+
     def get_status(self) -> Dict[str, Any]:
         """Get current bot status"""
         status = {
@@ -1390,7 +1540,7 @@ class TradingBot:
             },
             'server_time': self._now().isoformat(),
         }
-        
+
         # Add position details
         if self.current_position:
             status['current_position'] = {
@@ -1402,19 +1552,19 @@ class TradingBot:
                 'take_profit_price': self.take_profit_price,
                 'symbol': self.config.symbol
             }
-        
+
         # Add cooldown info
         if self.cooldown_until:
             remaining = (self.cooldown_until - self._now()).total_seconds()
             if remaining > 0:
                 status['cooldown_remaining'] = int(remaining)
-        
+
         # Add profit analysis
         if self.current_position:
             status['profit_analysis'] = self.profit_analyzer.get_statistics()
-        
+
         return status
-    
+
     async def cleanup(self):
         """Cleanup resources"""
         await self.client.aclose()
