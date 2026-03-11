@@ -61,54 +61,6 @@ class TradingConfig:
 
 
 class TradingBot:
-        async def quick_trade_decision(self):
-            """
-            Evaluate chart bar quickly and enter buy/sell. Close after 30 seconds.
-            """
-            price_data = await self._get_market_price()
-            if not price_data:
-                logger.info("No price data for quick trade.")
-                return
-            current_price = price_data.get('bid', 0)
-            candles = await self._get_market_candles(
-                timeframe=self.config.entry_timeframe,
-                limit=3,
-            )
-            if not candles or len(candles) < 3:
-                logger.info("Not enough candles for quick trade.")
-                return
-            last_bar = candles[-1]
-            prev_bar = candles[-2]
-            # Simple logic: if last bar is positive and going up, buy; if negative and going down, sell
-            bar_change = last_bar['close'] - last_bar['open']
-            trend = last_bar['close'] - prev_bar['close']
-            if bar_change > 0 and trend > 0:
-                action = 'buy'
-            elif bar_change < 0 and trend < 0:
-                action = 'sell'
-            else:
-                logger.info("No clear quick trade signal.")
-                return
-            logger.info(f"QUICK TRADE: {action.upper()} @ {current_price}")
-            order_result = await self._place_order(
-                symbol=self.config.symbol,
-                side=action,
-                quantity=1,
-                amount=self.config.purchase_amount
-            )
-            if order_result and order_result.get('success'):
-                self.current_position = order_result
-                self.entry_price = current_price
-                self.position_id = order_result.get('orderId') or order_result.get('id')
-                self.position_code = self._extract_position_code_from_result(order_result)
-                self.entry_side = action.upper()
-                self.entry_quantity = 1.0
-                logger.info(f"QUICK TRADE OPENED: {self.position_id}")
-                await asyncio.sleep(30)
-                await self._close_position("Quick trade timed close")
-            else:
-                logger.error(f"QUICK TRADE FAILED: {order_result}")
-class TradingBot:
     def __init__(
         self,
         account_id: str,
@@ -238,6 +190,7 @@ class TradingBot:
                     "reason": "Startup preflight failed: market quote unavailable (session unauthorized or marketdata blocked)",
                 }
                 logger.error("❌ Bot start preflight failed: cannot access market quote")
+                logger.error(f"DETAILS: account_id={self.account_id}, session_token={self.session_token}, config={self.config}")
                 return False
         except Exception as e:
             self._set_blocked("startup_exception", {"error": str(e)})
@@ -246,6 +199,7 @@ class TradingBot:
                 "reason": f"Startup preflight failed: {e}",
             }
             logger.error(f"❌ Bot start preflight exception: {e}")
+            logger.error(f"DETAILS: account_id={self.account_id}, session_token={self.session_token}, config={self.config}")
             return False
         
         logger.info(f"🚀 Starting NAS100 Trading Bot")
