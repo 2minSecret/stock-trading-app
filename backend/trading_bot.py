@@ -188,14 +188,29 @@ class TradingBot:
 		
     async def quick_trade_decision(self):
         """Evaluate chart bar quickly and enter buy/sell. Close after 30 seconds."""
-        # Force a trade immediately, no waiting or checks
+        # Force a trade immediately, with TP/SL marker logic
         price_data = await self._get_market_price()
         current_price = price_data.get('bid', 0) if price_data else 0
+        # Decide trade side (could alternate or use logic)
         trade_side = "buy"  # Default to BUY
-        logger.info("Quick trade: FORCED BUY triggered.")
-        await self._place_order(side=trade_side, price=current_price)
+
+        # Place TP/SL markers in optimal positions
+        if trade_side == "buy":
+            take_profit_price = round(current_price * 1.01, 2)  # TP above entry
+            stop_loss_price = round(current_price * 0.99, 2)    # SL below entry
+        else:
+            take_profit_price = round(current_price * 0.99, 2)  # TP below entry
+            stop_loss_price = round(current_price * 1.01, 2)    # SL above entry
+
+        logger.info(f"Quick trade: {trade_side.upper()} triggered. TP={take_profit_price}, SL={stop_loss_price}")
+        await self._place_order(
+            side=trade_side,
+            price=current_price,
+            take_profit_price=take_profit_price,
+            stop_loss_price=stop_loss_price
+        )
         await asyncio.sleep(30)
-        logger.info("Quick trade: Closing BUY after 30 seconds.")
+        logger.info(f"Quick trade: Closing {trade_side.upper()} after 30 seconds.")
         await self._close_position()
 
     async def start(self):
@@ -1443,12 +1458,14 @@ class TradingBot:
         self,
         symbol: str,
         side: str,
-        quantity: float,
-        amount: float,
+        quantity: float = 1.0,
+        amount: float = 0.0,
         position_effect: str = "OPEN",
         position_code: Optional[str] = None,
         order_type: str = "MARKET",
         price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
+        stop_loss_price: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Place an order via LiquidCharts real API."""
         try:
@@ -1470,6 +1487,10 @@ class TradingBot:
                 payload["positionCode"] = str(position_code)
             if price is not None:
                 payload["price"] = float(price)
+            if take_profit_price is not None:
+                payload["takeProfitPrice"] = float(take_profit_price)
+            if stop_loss_price is not None:
+                payload["stopLossPrice"] = float(stop_loss_price)
 
             # DXAPI token (should be securely stored/retrieved)
             dxapi_token = self.session_token or "YOUR_DXAPI_TOKEN_HERE"
@@ -1504,6 +1525,15 @@ class TradingBot:
         except Exception as e:
             logger.error(f"❌ Error placing order: {e}")
             return None
+
+# User-triggered close function
+    async def user_close_position(self):
+        """Allow user to close the current position manually."""
+        if self.current_position and self.position_id:
+            logger.info("User requested manual close of position.")
+            await self._close_position("User manual close")
+        else:
+            logger.info("No position to close.")
 
     def get_status(self) -> Dict[str, Any]:
         """Get current bot status"""
