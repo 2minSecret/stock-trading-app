@@ -188,25 +188,14 @@ class TradingBot:
 		
     async def quick_trade_decision(self):
         """Evaluate chart bar quickly and enter buy/sell. Close after 30 seconds."""
+        # Force a trade immediately, no waiting or checks
         price_data = await self._get_market_price()
         current_price = price_data.get('bid', 0) if price_data else 0
-        candles = await self._get_market_candles(
-            timeframe=self.config.entry_timeframe,
-            limit=3,
-        ) if price_data else None
-
-        # Always make a trade immediately
-        trade_side = "buy"
-        if candles and len(candles) >= 3:
-            last_bar = candles[-1]
-            prev_bar = candles[-2]
-            if last_bar['close'] < last_bar['open'] and last_bar['close'] < prev_bar['close']:
-                trade_side = "sell"
-
-        logger.info(f"Quick trade: FORCED {trade_side.upper()} triggered.")
+        trade_side = "buy"  # Default to BUY
+        logger.info("Quick trade: FORCED BUY triggered.")
         await self._place_order(side=trade_side, price=current_price)
         await asyncio.sleep(30)
-        logger.info(f"Quick trade: Closing {trade_side.upper()} after 30 seconds.")
+        logger.info("Quick trade: Closing BUY after 30 seconds.")
         await self._close_position()
 
     async def start(self):
@@ -322,17 +311,23 @@ class TradingBot:
                     # Try to make a trade up to 3 times
                     trade_attempts = 0
                     while self.current_position is None and trade_attempts < 3 and self._is_within_trading_window(current_time):
-                        await self.quick_trade_decision()
+                        try:
+                            await self.quick_trade_decision()
+                        except Exception as e:
+                            logger.error(f"Error in quick_trade_decision: {e}")
                         trade_attempts += 1
                         # If a position was opened, wait 30 seconds and close it before next attempt
                         if self.current_position is not None:
                             logger.info("Waiting 30 seconds before closing position and next trade attempt.")
                             await asyncio.sleep(30)
-                            await self._close_position("Auto-close after 30 seconds")
+                            try:
+                                await self._close_position("Auto-close after 30 seconds")
+                            except Exception as e:
+                                logger.error(f"Error closing position: {e}")
                         else:
                             logger.info(f"Quick trade attempt {trade_attempts} did not result in a position. Retrying...")
                             await asyncio.sleep(5)  # Short interval between attempts
-                    self._set_blocked(None)
+                        self._set_blocked(None)
                 else:
                     self.state = BotState.IN_POSITION
                     self._set_blocked(None)
