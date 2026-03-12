@@ -189,34 +189,25 @@ class TradingBot:
     async def quick_trade_decision(self):
         """Evaluate chart bar quickly and enter buy/sell. Close after 30 seconds."""
         price_data = await self._get_market_price()
-        if not price_data:
-            logger.info("No price data for quick trade.")
-            return
-        current_price = price_data.get('bid', 0)
+        current_price = price_data.get('bid', 0) if price_data else 0
         candles = await self._get_market_candles(
             timeframe=self.config.entry_timeframe,
             limit=3,
-        )
-        if not candles or len(candles) < 3:
-            logger.info("Not enough candles for quick trade.")
-            return
-        last_bar = candles[-1]
-        prev_bar = candles[-2]
-        # Example logic: Buy if last bar is positive and rising, Sell if negative and falling
-        if last_bar['close'] > last_bar['open'] and last_bar['close'] > prev_bar['close']:
-            logger.info("Quick trade: BUY triggered.")
-            await self._place_order(side="buy", price=current_price)
-            await asyncio.sleep(30)
-            logger.info("Quick trade: Closing BUY after 30 seconds.")
-            await self._close_position()
-        elif last_bar['close'] < last_bar['open'] and last_bar['close'] < prev_bar['close']:
-            logger.info("Quick trade: SELL triggered.")
-            await self._place_order(side="sell", price=current_price)
-            await asyncio.sleep(30)
-            logger.info("Quick trade: Closing SELL after 30 seconds.")
-            await self._close_position()
-        else:
-            logger.info("Quick trade: No action taken.")
+        ) if price_data else None
+
+        # Always make a trade immediately
+        trade_side = "buy"
+        if candles and len(candles) >= 3:
+            last_bar = candles[-1]
+            prev_bar = candles[-2]
+            if last_bar['close'] < last_bar['open'] and last_bar['close'] < prev_bar['close']:
+                trade_side = "sell"
+
+        logger.info(f"Quick trade: FORCED {trade_side.upper()} triggered.")
+        await self._place_order(side=trade_side, price=current_price)
+        await asyncio.sleep(30)
+        logger.info(f"Quick trade: Closing {trade_side.upper()} after 30 seconds.")
+        await self._close_position()
 
     async def start(self):
         """Start the trading bot"""
@@ -328,8 +319,19 @@ class TradingBot:
                     self.state = BotState.MONITORING_ENTRY
                     self._set_blocked("quick_trade_decision")
                     logger.info("⚡ Immediate quick trade decision on bot activation")
-                    await self.quick_trade_decision()
-                    # Always clear blocked status after quick_trade_decision
+                    # Try to make a trade up to 3 times
+                    trade_attempts = 0
+                    while self.current_position is None and trade_attempts < 3 and self._is_within_trading_window(current_time):
+                        await self.quick_trade_decision()
+                        trade_attempts += 1
+                        # If a position was opened, wait 30 seconds and close it before next attempt
+                        if self.current_position is not None:
+                            logger.info("Waiting 30 seconds before closing position and next trade attempt.")
+                            await asyncio.sleep(30)
+                            await self._close_position("Auto-close after 30 seconds")
+                        else:
+                            logger.info(f"Quick trade attempt {trade_attempts} did not result in a position. Retrying...")
+                            await asyncio.sleep(5)  # Short interval between attempts
                     self._set_blocked(None)
                 else:
                     self.state = BotState.IN_POSITION
