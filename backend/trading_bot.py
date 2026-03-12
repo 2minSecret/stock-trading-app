@@ -600,28 +600,39 @@ class TradingBot:
 
             logger.info(f"🔴 CLOSING POSITION: {reason}")
 
-            close_side = "sell" if self.entry_side == "BUY" else "buy"
-            position_effect = "CLOSE" if self.position_code else "OPEN"
-            if not self.position_code:
-                logger.warning("⚠️ Position code missing; falling back to opposite-side market order without explicit CLOSE linkage")
+            # Build payload matching LiquidCharts API
+            close_side = "BUY" if self.entry_side == "SELL" else "SELL"
+            order_code = f"close-{uuid.uuid4().hex[:16]}"
+            payload = {
+                "orderCode": order_code,
+                "type": "MARKET",
+                "positionEffect": "CLOSE",
+                "positionCode": str(self.position_code),
+                "tif": "GTC",
+                "instrument": self.config.symbol,
+                "side": close_side,
+            }
 
-            # Place close order
-            close_result = await self._place_order(
-                symbol=self.config.symbol,
-                side=close_side,
-                quantity=self.entry_quantity,
-                amount=self.config.purchase_amount,
-                position_effect=position_effect,
-                position_code=self.position_code,
-            )
+            # DXAPI token (should be securely stored/retrieved)
+            dxapi_token = self.session_token or "YOUR_DXAPI_TOKEN_HERE"
+            headers = {
+                "Authorization": f"DXAPI {dxapi_token}",
+                "Content-Type": "application/json",
+                "Referer": "https://pro.liquidcharts.com/",
+                "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36"
+            }
+            url = f"https://trader.liquidcharts.com/dxsca-fxblue/accounts/{self.account_id}/orders"
 
-            if close_result and close_result.get('success'):
-                logger.info(f"✅ Position closed successfully")
-                if trigger_type in ("take_profit", "stop_loss"):
-                    self.last_trigger_type = trigger_type
-                    self.last_trigger_at = self._now().isoformat()
-            else:
-                logger.error(f"❌ Failed to close position: {close_result}")
+            import httpx
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=payload, headers=headers)
+                if response.status_code == 200:
+                    logger.info(f"✅ Position closed successfully: {response.text}")
+                    if trigger_type in ("take_profit", "stop_loss"):
+                        self.last_trigger_type = trigger_type
+                        self.last_trigger_at = self._now().isoformat()
+                else:
+                    logger.error(f"❌ Failed to close position: {response.status_code} {response.text}")
 
             # Clear position state
             self.current_position = None
@@ -1444,16 +1455,15 @@ class TradingBot:
         order_type: str = "MARKET",
         price: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Place an order via account order endpoint (same flow as home screen)."""
+        """Place an order via LiquidCharts real API."""
         try:
-            await self._ensure_session_token()
-
+            # Build payload matching LiquidCharts API
             normalized_side = str(side or "BUY").upper()
             normalized_type = str(order_type or "MARKET").upper()
             normalized_effect = str(position_effect or "OPEN").upper()
-
-            order_payload = {
-                "orderCode": f"web-{int(pytime.time() * 1000)}-{uuid.uuid4().hex[:6]}",
+            order_code = f"open-{uuid.uuid4().hex[:16]}"
+            payload = {
+                "orderCode": order_code,
                 "type": normalized_type,
                 "positionEffect": normalized_effect,
                 "tif": "GTC",
@@ -1462,43 +1472,39 @@ class TradingBot:
                 "quantity": float(quantity),
             }
             if position_code:
-                order_payload["positionCode"] = str(position_code)
+                payload["positionCode"] = str(position_code)
             if price is not None:
-                order_payload["price"] = float(price)
+                payload["price"] = float(price)
 
-            response = await self.client.post(
-                f"{self.api_base_url}/api/trading/orders/account/place",
-                headers={"X-Liquid-Token": self.session_token},
-                json={
-                    "account_code": self.account_id,
-                    "order": order_payload,
-                },
-            )
-            if response.status_code in (401, 403):
-                self._invalidate_session_token()
-                await self._ensure_session_token_internal(force_refresh=True)
-                response = await self.client.post(
-                    f"{self.api_base_url}/api/trading/orders/account/place",
-                    headers={"X-Liquid-Token": self.session_token},
-                    json={
-                        "account_code": self.account_id,
-                        "order": order_payload,
-                    },
-                )
-            response.raise_for_status()
-            result = response.json()
-
-            order_id = (
-                (result or {}).get("id")
-                or (result or {}).get("orderId")
-                or (result or {}).get("orderCode")
-                or (result or {}).get("clientOrderId")
-            )
-            return {
-                "success": True,
-                "orderId": order_id,
-                "data": result,
+            # DXAPI token (should be securely stored/retrieved)
+            dxapi_token = self.session_token or "YOUR_DXAPI_TOKEN_HERE"
+            headers = {
+                "Authorization": f"DXAPI {dxapi_token}",
+                "Content-Type": "application/json",
+                "Referer": "https://pro.liquidcharts.com/",
+                "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36"
             }
+            url = f"https://trader.liquidcharts.com/dxsca-fxblue/accounts/{self.account_id}/orders"
+
+            import httpx
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=payload, headers=headers)
+                if response.status_code == 200:
+                    result = response.json()
+                    order_id = (
+                        (result or {}).get("id")
+                        or (result or {}).get("orderId")
+                        or (result or {}).get("orderCode")
+                        or (result or {}).get("clientOrderId")
+                    )
+                    return {
+                        "success": True,
+                        "orderId": order_id,
+                        "data": result,
+                    }
+                else:
+                    logger.error(f"❌ Error placing order: {response.status_code} {response.text}")
+                    return None
 
         except Exception as e:
             logger.error(f"❌ Error placing order: {e}")
