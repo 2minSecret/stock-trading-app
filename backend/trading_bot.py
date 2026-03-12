@@ -329,6 +329,8 @@ class TradingBot:
                     self._set_blocked("quick_trade_decision")
                     logger.info("⚡ Immediate quick trade decision on bot activation")
                     await self.quick_trade_decision()
+                    # Always clear blocked status after quick_trade_decision
+                    self._set_blocked(None)
                 else:
                     self.state = BotState.IN_POSITION
                     self._set_blocked(None)
