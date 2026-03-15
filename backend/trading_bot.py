@@ -1502,9 +1502,13 @@ class TradingBot:
             }
             url = f"https://trader.liquidcharts.com/dxsca-fxblue/accounts/{self.account_id}/orders"
 
+            # Log payload before sending
+            logger.info(f"Placing order payload: {payload}")
+
             import httpx
             async with httpx.AsyncClient() as client:
                 response = await client.post(url, json=payload, headers=headers)
+                logger.info(f"LiquidCharts response [{response.status_code}]: {response.text}")
                 if response.status_code == 200:
                     result = response.json()
                     order_id = (
@@ -1513,6 +1517,13 @@ class TradingBot:
                         or (result or {}).get("orderCode")
                         or (result or {}).get("clientOrderId")
                     )
+                    # Log SL/TP errors if present
+                    sl_error = result.get("errors", {}).get("stop_loss") if isinstance(result, dict) else None
+                    tp_error = result.get("errors", {}).get("take_profit") if isinstance(result, dict) else None
+                    if sl_error:
+                        logger.error(f"SL error from LiquidCharts: {sl_error}")
+                    if tp_error:
+                        logger.error(f"TP error from LiquidCharts: {tp_error}")
                     return {
                         "success": True,
                         "orderId": order_id,
