@@ -47,6 +47,7 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
   const [error, setError] = useState(null);
   
   // Configuration state
+  const [instrument, setInstrument] = useState('NAS100');
   const [startTime, setStartTime] = useState('09:25');
   const [endTime, setEndTime] = useState('10:05');
   const [activeDays, setActiveDays] = useState([1, 2, 3, 4, 5]); // Mon-Fri
@@ -58,6 +59,42 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
   const [profitPatienceMin, setProfitPatienceMin] = useState(60);
   const [profitPatienceMax, setProfitPatienceMax] = useState(180);
   const [profitDeclineThreshold, setProfitDeclineThreshold] = useState(2);
+  // Trading hours lookup
+  const tradingHours = {
+    NAS100: {
+      name: 'Nasdaq 100 Futures',
+      hours: 'Sunday 5:00 PM to Friday 4:00 PM ET (daily halt 4:00–5:00 PM ET)',
+      check: () => {
+        const now = new Date();
+        const utcHour = now.getUTCHours();
+        const utcDay = now.getUTCDay();
+        const isWeekend = utcDay === 6 || (utcDay === 0 && utcHour < 22);
+        const isDailyHalt = utcHour === 21;
+        return !(isWeekend || isDailyHalt);
+      }
+    },
+    AAPL: {
+      name: 'Apple Inc. Stock',
+      hours: 'Monday–Friday 9:30 AM to 4:00 PM ET',
+      check: () => {
+        const now = new Date();
+        const hour = now.getHours();
+        const day = now.getDay();
+        return day >= 1 && day <= 5 && hour >= 9 && hour < 16;
+      }
+    },
+    MSFT: {
+      name: 'Microsoft Stock',
+      hours: 'Monday–Friday 9:30 AM to 4:00 PM ET',
+      check: () => {
+        const now = new Date();
+        const hour = now.getHours();
+        const day = now.getDay();
+        return day >= 1 && day <= 5 && hour >= 9 && hour < 16;
+      }
+    },
+    // Add more instruments as needed
+  };
 
   useEffect(() => {
     try {
@@ -164,6 +201,13 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
       return;
     }
 
+    // Market hours check
+    const instrumentHours = tradingHours[instrument];
+    if (instrumentHours && !instrumentHours.check()) {
+      setError(`The market is closed for ${instrumentHours.name}. Trading hours: ${instrumentHours.hours}`);
+      return;
+    }
+
     try {
       setIsLoading(true);
       setError(null);
@@ -171,6 +215,7 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
       const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
       const customConfig = {
+        INSTRUMENT: instrument,
         TRADING_WINDOW: { START: startTime, END: endTime },
         ACTIVE_DAYS: normalizeActiveDays(activeDays),
         PURCHASE_AMOUNT: parseFloat(purchaseAmount),
@@ -323,13 +368,25 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
   return (
     <div className="bot-config-modal-overlay" onClick={onClose}>
       <div className="bot-config-panel" onClick={(e) => e.stopPropagation()}>
-        
         <div className="bot-config-header">
           <div>
             <h3>🤖 Bot Configuration</h3>
             <p className="text-xs text-gray-400 mt-1">Account: {selectedAccount.accountId}</p>
           </div>
           <button onClick={onClose} className="close-btn">✕</button>
+        </div>
+
+        {/* Instrument Selection */}
+        <div className="config-section">
+          <div className="config-title">
+            <span>Instrument</span>
+          </div>
+          <select value={instrument} onChange={e => setInstrument(e.target.value)} disabled={botStatus?.is_running}>
+            <option value="NAS100">NAS100 (Nasdaq 100 Futures)</option>
+            <option value="AAPL">AAPL (Apple Inc. Stock)</option>
+            <option value="MSFT">MSFT (Microsoft Stock)</option>
+            {/* Add more options as needed */}
+          </select>
         </div>
 
         {/* Bot Status */}
@@ -378,7 +435,6 @@ export default function BotConfigPanel({ selectedAccount, currentUser, onClose }
             <Clock size={16} />
             <span>Trading Hours</span>
           </div>
-          
           <div className="time-input-group">
             <div className="time-input">
               <label>Start Time</label>

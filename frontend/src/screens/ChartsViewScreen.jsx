@@ -425,6 +425,48 @@ export default function ChartsViewScreen({
   }, [draggingLine, currentEntryPrice, isBuySide, chartTop, chartSpan]);
 
   const handlePlaceBracket = async () => {
+        // Trading hours lookup
+        const tradingHours = {
+          NAS100: {
+            name: 'Nasdaq 100 Futures',
+            hours: 'Sunday 5:00 PM to Friday 4:00 PM ET (daily halt 4:00–5:00 PM ET)',
+            check: () => {
+              const now = new Date();
+              const utcHour = now.getUTCHours();
+              const utcDay = now.getUTCDay();
+              // Sunday 22:00 UTC to Friday 21:00 UTC, daily halt 21:00-22:00 UTC
+              const isWeekend = utcDay === 6 || (utcDay === 0 && utcHour < 22);
+              const isDailyHalt = utcHour === 21;
+              return !(isWeekend || isDailyHalt);
+            }
+          },
+          AAPL: {
+            name: 'Apple Inc. Stock',
+            hours: 'Monday–Friday 9:30 AM to 4:00 PM ET',
+            check: () => {
+              const now = new Date();
+              const hour = now.getHours();
+              const day = now.getDay();
+              return day >= 1 && day <= 5 && hour >= 9 && hour < 16;
+            }
+          },
+          MSFT: {
+            name: 'Microsoft Stock',
+            hours: 'Monday–Friday 9:30 AM to 4:00 PM ET',
+            check: () => {
+              const now = new Date();
+              const hour = now.getHours();
+              const day = now.getDay();
+              return day >= 1 && day <= 5 && hour >= 9 && hour < 16;
+            }
+          },
+          // Add more instruments as needed
+        };
+        const instrumentHours = tradingHours[selectedTicker];
+        if (instrumentHours && !instrumentHours.check()) {
+          setBracketError(`The market is closed for ${instrumentHours.name}. Trading hours: ${instrumentHours.hours}`);
+          return;
+        }
     setBracketStatus('');
     setBracketError('');
     setPendingPositionOrderId(null);
