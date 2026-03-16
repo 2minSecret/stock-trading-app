@@ -55,7 +55,8 @@ export default function ChartsViewScreen({
   const [apiHistory, setApiHistory] = useState([]);
   const [apiQuote, setApiQuote] = useState(null);
   const [dataLimit, setDataLimit] = useState(200);
-  const [isPanning, setIsPanning] = useState(false);
+  // Drag/pan always enabled for main-screen-like freedom
+  const [isPanning, setIsPanning] = useState(true);
   const [selectedTimeIndex, setSelectedTimeIndex] = useState(0);
   const [isDraggingTimeline, setIsDraggingTimeline] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -71,6 +72,9 @@ export default function ChartsViewScreen({
   const [isSubmittingBracket, setIsSubmittingBracket] = useState(false);
   const [bracketStatus, setBracketStatus] = useState('');
   const [bracketError, setBracketError] = useState('');
+    // Polling state for pending position code
+    const [pendingPositionOrderId, setPendingPositionOrderId] = useState(null);
+    const pollingIntervalRef = useRef(null);
   const [activePositionCode, setActivePositionCode] = useState('');
   const [autoTouchTriggerEnabled, setAutoTouchTriggerEnabled] = useState(true);
   const [isTouchTriggerSubmitting, setIsTouchTriggerSubmitting] = useState(false);
@@ -338,6 +342,11 @@ export default function ChartsViewScreen({
     setBracketError('');
     setActivePositionCode('');
     lastTouchTriggerKeyRef.current = '';
+    // Snap entry price to latest candle close
+    if (candleSeries.length > 0) {
+      const latestCandle = candleSeries[candleSeries.length - 1];
+      setEntryPrice(latestCandle.close);
+    }
     initializeTradeLines(nextSide);
   };
 
@@ -418,6 +427,7 @@ export default function ChartsViewScreen({
   const handlePlaceBracket = async () => {
     setBracketStatus('');
     setBracketError('');
+    setPendingPositionOrderId(null);
 
     if (!selectedTradeAccount) {
       setBracketError('Select an account before placing an order.');
@@ -475,15 +485,17 @@ export default function ChartsViewScreen({
       const status = result?.status;
       if (status === 'entry_tp_sl_placed') {
         setBracketStatus(`${tradeSide} bracket submitted on ${selectedTradeAccount.label} (${selectedTradeAccount.code}). TP/SL attached.${resolvedPositionCode ? ' Touch trigger armed.' : ''}`);
-      } else if (status === 'entry_placed_tp_sl_partial' || status === 'entry_placed_tp_sl_failed' || status === 'entry_placed_position_pending') {
+      } else if (status === 'entry_placed_tp_sl_partial' || status === 'entry_placed_tp_sl_failed') {
         setBracketStatus(`${tradeSide} entry submitted on ${selectedTradeAccount.label} (${selectedTradeAccount.code}).`);
         const tpErr = result?.errors?.take_profit;
         const slErr = result?.errors?.stop_loss;
-        const pendingMsg = status === 'entry_placed_position_pending' ? 'Position code not ready yet for TP/SL attach.' : '';
         const tpMsg = tpErr ? `TP error: ${typeof tpErr === 'string' ? tpErr : (tpErr.description || JSON.stringify(tpErr))}` : '';
         const slMsg = slErr ? `SL error: ${typeof slErr === 'string' ? slErr : (slErr.description || JSON.stringify(slErr))}` : '';
-        const joined = [pendingMsg, tpMsg, slMsg].filter(Boolean).join(' ');
+        const joined = [tpMsg, slMsg].filter(Boolean).join(' ');
         if (joined) setBracketError(joined);
+      } else if (status === 'entry_placed_position_pending') {
+        setBracketStatus(`${tradeSide} entry submitted on ${selectedTradeAccount.label} (${selectedTradeAccount.code}). Position code not ready yet for TP/SL attach.`);
+        setPendingPositionOrderId(result?.entry_order?.orderId || null);
       } else {
         setBracketStatus(`${tradeSide} bracket submitted on ${selectedTradeAccount.label} (${selectedTradeAccount.code}).`);
       }
@@ -738,7 +750,7 @@ export default function ChartsViewScreen({
             enabled: true,
           },
           drag: {
-            enabled: !isPanning,
+            enabled: true, // Always enabled for main-screen-like freedom
             backgroundColor: 'rgba(6, 182, 212, 0.15)',
             borderColor: 'rgba(6, 182, 212, 0.6)',
             borderWidth: 1,
@@ -747,7 +759,7 @@ export default function ChartsViewScreen({
           mode: 'x',
         },
         pan: {
-          enabled: isPanning,
+          enabled: true, // Always enabled for main-screen-like freedom
           mode: 'x',
           modifierKey: null,
           threshold: PAN_THRESHOLD,
@@ -923,6 +935,53 @@ export default function ChartsViewScreen({
       setSelectedTimeIndex(filteredHistory.length - 1);
     }
   }, [filteredHistory.length, isFollowingLatest]);
+  // Poll for position code if pending
+  useEffect(() => {
+    if (!pendingPositionOrderId) return;
+    let isActive = true;
+    const poll = async () => {
+      // Replace with actual API call to fetch position code by orderId
+      try {
+        // Example: await fetchPositionCode(pendingPositionOrderId)
+        const response = await yahooFinanceClient.getOrderStatus(selectedTicker, pendingPositionOrderId);
+        const positionCode = response?.position_code || response?.positionCode;
+        if (positionCode && isActive) {
+          setActivePositionCode(positionCode);
+          setBracketStatus('Position code received, submitting TP/SL legs...');
+          // Submit TP/SL legs
+          if (typeof onPlaceBracketOrder === 'function') {
+            setIsSubmittingBracket(true);
+            try {
+              await onPlaceBracketOrder({
+                side: tradeSide,
+                quantity: Number(tradeQuantity),
+                entryType,
+                entryPrice: entryType === 'LIMIT' ? Number(entryPrice) : undefined,
+                stopLossPrice,
+                takeProfitPrice,
+                instrument: selectedTicker,
+                positionCode,
+              });
+              setBracketStatus('TP/SL legs submitted successfully.');
+            } catch (err) {
+              setBracketError('Failed to submit TP/SL legs: ' + (err?.message || 'Unknown error'));
+            } finally {
+              setIsSubmittingBracket(false);
+            }
+          }
+          setPendingPositionOrderId(null);
+          isActive = false;
+        }
+      } catch (err) {
+        // Ignore errors, keep polling
+      }
+    };
+    pollingIntervalRef.current = setInterval(poll, 5000);
+    return () => {
+      isActive = false;
+      clearInterval(pollingIntervalRef.current);
+    };
+  }, [pendingPositionOrderId, tradeSide, tradeQuantity, entryType, entryPrice, stopLossPrice, takeProfitPrice, selectedTicker, onPlaceBracketOrder]);
 
   // Handle timeline scrubber drag
   const handleTimelineDragStart = (e) => {

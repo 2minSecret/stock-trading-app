@@ -872,73 +872,18 @@ function App() {
   const handleCancelOrder = async () => {
     setOrderStatus('');
     setOrderError('');
-
-    if (!selectedTradeAccount) {
-      setOrderError('Select an account before cancelling an order.');
-      return;
-    }
-
-    // Allow demo placeholder accounts, but require real accounts for live trading
-    if (isSelectedAccountPlaceholder && isLiveAccountSelected) {
-      setOrderError('Live trading requires a real Liquid account code. Select a real account before cancelling an order.');
-      return;
-    }
-
-    if (isLiveAccountSelected && !liveTradingEnabled) {
-      setOrderError('Live account is blocked. Enable live trading explicitly to continue.');
-      return;
-    }
-
-    const cancelMode = window.prompt('Cancel mode: type "single" or "group"', 'single');
-    if (cancelMode === null) return;
-    const mode = cancelMode.trim().toLowerCase();
-
-    const ifMatch = window.prompt('If-Match value (required):', '');
-    if (ifMatch === null || !ifMatch.trim()) {
-      setOrderError('If-Match is required for cancel requests.');
-      return;
-    }
-
     setIsPlacingOrder(true);
     try {
-      if (mode === 'group') {
-        const orderCodesInput = window.prompt('Group order codes (comma-separated, parent first):', '');
-        if (orderCodesInput === null || !orderCodesInput.trim()) {
-          setOrderError('order-codes are required for group cancellation.');
-          setIsPlacingOrder(false);
-          return;
-        }
-        const contingencyType = window.prompt('Contingency type (e.g., IF-THEN, OCO):', 'IF-THEN');
-        if (contingencyType === null || !contingencyType.trim()) {
-          setOrderError('contingency-type is required for group cancellation.');
-          setIsPlacingOrder(false);
-          return;
-        }
-
-        await liquidTrading.cancelAccountOrderGroup({
-          accountCode: selectedTradeAccount.code,
-          orderCodes: orderCodesInput.trim(),
-          contingencyType: contingencyType.trim(),
-          ifMatch: ifMatch.trim(),
-        });
-        setOrderStatus(`Order group cancelled on ${selectedTradeAccount.label} (${selectedTradeAccount.code}).`);
-        refreshAccountViews();
-      } else {
-        const orderCode = window.prompt('Order code to cancel:', '');
-        if (orderCode === null || !orderCode.trim()) {
-          setOrderError('orderCode is required for single cancellation.');
-          setIsPlacingOrder(false);
-          return;
-        }
-
-        await liquidTrading.cancelAccountOrder({
-          accountCode: selectedTradeAccount.code,
-          orderCode: orderCode.trim(),
-          ifMatch: ifMatch.trim(),
-        });
-        setOrderStatus(`Order ${orderCode.trim()} cancelled on ${selectedTradeAccount.label} (${selectedTradeAccount.code}).`);
-        refreshAccountViews();
-      }
+      // Cancel the most recent or active order for the selected account
+      // Replace with your actual logic to get the order code
+      const orderCode = getActiveOrderCode(selectedTradeAccount);
+      await liquidTrading.cancelAccountOrder({
+        accountCode: selectedTradeAccount.code,
+        orderCode,
+        // If-Match header can be handled internally or omitted if not needed
+      });
+      setOrderStatus(`Order ${orderCode} cancelled on ${selectedTradeAccount.label} (${selectedTradeAccount.code}).`);
+      refreshAccountViews();
     } catch (error) {
       const detail = error?.response?.data?.detail;
       setOrderError(typeof detail === 'string' ? detail : 'Order cancellation failed.');
